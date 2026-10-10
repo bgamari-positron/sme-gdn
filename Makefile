@@ -1,6 +1,6 @@
 CROSS_CXX ?= aarch64-unknown-linux-musl-c++
 QEMU ?= qemu-aarch64
-CXXFLAGS ?= -O3 -g -std=c++17 -march=armv9-a+sme -Wall -Wextra -Werror
+CXXFLAGS ?= -O3 -g -std=c++17 -march=armv9-a+sme2 -Wall -Wextra -Werror
 LDFLAGS ?= -static
 SVL_BYTES ?= 16 32 64 128 256
 

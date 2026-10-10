@@ -132,6 +132,11 @@ int main(int argc, char** argv) {
     std::puts("Includes per-call streaming transitions. Emulated timings are NOT C1 performance estimates.");
 #if defined(__ARM_FEATURE_SME)
     std::printf("Streaming vector length: %zu bytes\n", streaming_bytes());
+#if defined(__ARM_FEATURE_SME2)
+    std::puts("Blocked kernels: SME2 grouped loads enabled for full B=2/4 blocks.");
+#else
+    std::puts("Blocked kernels: SME1 single-vector loads.");
+#endif
 #else
     std::puts("Scalar-only build: SME kernels are not compiled.");
 #endif

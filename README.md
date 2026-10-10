@@ -136,6 +136,24 @@ output element still accumulates state rows in the original order. The update us
 retains two state reads and one state write. It inherits scalar prediction/decay and range prefetch
 from the other SME backends.
 
+With SME2 enabled, full B=2 and B=4 blocks load adjacent state vectors with a single grouped `LD1W`.
+Both the prediction pass and the correction pass use these loads.
+The full-block check runs once per block, outside the state-row loops.
+Incomplete blocks and B=1/3 retain predicated single-vector loads; stores remain single-vector.
+An SME1 compilation uses single-vector loads for every block.
+
+The Makefile now targets `-march=armv9-a+sme2`, matching C1's SME2 support.
+The benchmark banner identifies whether grouped loads are compiled in.
+For an SME1 comparison, clean first and rebuild with the older target:
+
+```sh
+make clean
+make benchmark CXXFLAGS='-O3 -g -std=c++17 -march=armv9-a+sme -Wall -Wextra -Werror'
+```
+
+Run these commands from the example directory inside its Nix shell.
+Clean again before returning to the default SME2 build; Make does not track command-line flag changes.
+
 The implementation uses four-vector SVE tuples, with compile-time indices selecting the active
 vectors. This limits B to 1–4. Small inline template helpers let the compiler unroll the tuple
 operations. The helpers avoid a GCC 15 compiler crash encountered with streaming lambdas. The
