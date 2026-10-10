@@ -67,12 +67,12 @@ head.update(q, k, v, 1.0f, 0.5f, output);
 
 All implementations use the same methods and argument layout:
 
-| Template argument     | Implementation                                                       |
-| --------------------- | -------------------------------------------------------------------- |
-| `float` (the default) | Generic reference calculation with FP32 state.                       |
-| `double`              | The same reference code with FP64 state.                             |
-| `sme_matrix_float`    | FP32 update using SME matrix instructions and ZA storage.            |
-| `sme_vector_float`    | FP32 update using streaming vector instructions, without ZA storage. |
+| Template argument      | Implementation                                                                 |
+| ---------------------- | ------------------------------------------------------------------------------ |
+| `float` (the default)  | Generic reference calculation with FP32 state.                                 |
+| `double`               | The same reference code with FP64 state.                                       |
+| `sme_matrix_float`     | FP32 update using SME matrix instructions and ZA storage.                      |
+| `sme_vector_float`     | FP32 update using streaming vector instructions, without ZA storage.           |
 | `sme_blocked_float<B>` | FP32 streaming-vector update that processes B adjacent vectors together (1–4). |
 
 For example, select the vector implementation with `gdn_head<128, gated_delta::sme_vector_float>`.
@@ -125,21 +125,21 @@ Select a block size at compile time:
 using Head = gated_delta::gdn_head<128, gated_delta::sme_blocked_float<4>>;
 ```
 
-`B` counts adjacent streaming vectors, not scalar elements.
-Each vector contains `svcntw()` floats; on C1's 512-bit streaming engine, this is 16 floats.
-Thus `B=1`, `2`, `3`, or `4` processes 16, 32, 48, or 64 value columns per block on C1.
-Other streaming vector lengths work without recompilation, and predicates handle incomplete final vectors and blocks.
+`B` counts adjacent streaming vectors, not scalar elements. Each vector contains `svcntw()` floats;
+on C1's 512-bit streaming engine, this is 16 floats. Thus `B=1`, `2`, `3`, or `4` processes 16, 32,
+48, or 64 value columns per block on C1. Other streaming vector lengths work without recompilation,
+and predicates handle incomplete final vectors and blocks.
 
-The prediction loop loads each key component once and reuses it across B independent prediction vectors.
-The correction loop likewise shares each key and query load across B state vectors.
-Each output element still accumulates state rows in the original order.
-The update uses no ZA state and retains two state reads and one state write.
-It inherits scalar prediction/decay and range prefetch from the other SME backends.
+The prediction loop loads each key component once and reuses it across B independent prediction
+vectors. The correction loop likewise shares each key and query load across B state vectors. Each
+output element still accumulates state rows in the original order. The update uses no ZA state and
+retains two state reads and one state write. It inherits scalar prediction/decay and range prefetch
+from the other SME backends.
 
-The implementation uses four-vector SVE tuples, with compile-time indices selecting the active vectors.
-This limits B to 1–4. Small inline template helpers let the compiler unroll the tuple operations.
-The helpers avoid a GCC 15 compiler crash encountered with streaming lambdas.
-The checked GCC D=128 builds contain no helper calls or vector spills for any supported block size.
+The implementation uses four-vector SVE tuples, with compile-time indices selecting the active
+vectors. This limits B to 1–4. Small inline template helpers let the compiler unroll the tuple
+operations. The helpers avoid a GCC 15 compiler crash encountered with streaming lambdas. The
+checked GCC D=128 builds contain no helper calls or vector spills for any supported block size.
 Hardware measurements must determine the best block size; QEMU does not establish a speedup.
 
 ## Prefetching
@@ -180,9 +180,58 @@ make check
 ```
 
 The Makefile builds a static AArch64 executable, so QEMU needs no runtime sysroot. `make check`
-tests all backends, including block sizes 1–4, at streaming vector lengths of 16, 32, 64, 128, and 256 bytes. Use
-`make check SVL_BYTES=64` to run one length, or `make clean` to remove build outputs. QEMU validates
-instruction behavior, not CME performance or prefetch timing.
+tests all backends, including block sizes 1–4, at streaming vector lengths of 16, 32, 64, 128, and
+256 bytes. Use `make check SVL_BYTES=64` to run one length, or `make clean` to remove build outputs.
+QEMU validates instruction behavior, not CME performance or prefetch timing.
+
+## Benchmarking 128-dimensional heads
+
+`benchmark.cpp` compares float, double, matrix SME, vector SME, and blocked SME with block sizes
+1–4. It reports median and minimum nanoseconds per update, plus a checksum of the final state and
+output. Build the static AArch64 executable from the repository root:
+
+```sh
+nix develop "path:$PWD/examples/gated_delta" \
+  --command make -C examples/gated_delta benchmark
+```
+
+Copy `examples/gated_delta/build/benchmark` to an SME-capable AArch64 system. On that system, run:
+
+```sh
+./benchmark 10000 5
+```
+
+The arguments are updates per trial and number of trials; the defaults are 10000 and 5. Use enough
+updates to make each trial long compared with timer resolution and scheduling noise. On Linux, use
+`taskset -c <cpu> ./benchmark 10000 5` to pin the process to the intended CPU. Control CPU/CME
+clocks and competing work when comparing hardware results.
+
+Each trial starts with zero state and performs 64 untimed warmup updates. The timed loop updates one
+persistent head using 16 repeating, deterministic query/key/value inputs. All backends receive the
+same numeric inputs, including float-to-double conversion for the double backend. State and input
+storage are aligned to 64 bytes. Allocation, initialization, warmup, and checksum computation are
+outside the timed interval. Compiler barriers and the checksum prevent the state updates from being
+discarded. Explicit prefetch is disabled, and the SME measurements include per-call streaming-mode
+transitions. This measures repeated single-head API calls, not a multi-head scheduler or a
+persistent streaming batch. Run the correctness tests separately; a finite checksum alone does not
+establish correctness.
+
+For a short QEMU execution check:
+
+```sh
+nix develop "path:$PWD/examples/gated_delta" \
+  --command make -C examples/gated_delta benchmark-smoke
+```
+
+This runs 32 updates per trial and three trials at a 64-byte streaming vector length. **Do not use
+QEMU timings to select the fastest C1 kernel.** They measure emulator behavior, not CME execution. A
+host-only build can compare the scalar backends:
+
+```sh
+g++ -std=c++17 -O3 -Wall -Wextra -Werror \
+  examples/gated_delta/benchmark.cpp -o /tmp/gdn-benchmark
+/tmp/gdn-benchmark 10000 5
+```
 
 ## Scalar-only check
 
