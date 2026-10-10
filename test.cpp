@@ -75,6 +75,7 @@ void run() {
 
         reference.update_reference(q, k, v, alpha, beta, output);
 #if defined(__ARM_FEATURE_SME)
+        actual.prefetch_sme(); // Instruction smoke test, not a timing benchmark.
         actual.update_sme(q, k, v, alpha, beta, sme_output);
 #endif
         for (size_t j = 0; j < D; ++j) {

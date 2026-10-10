@@ -1,8 +1,8 @@
 # Single-head gated delta update
 
-`gdn_head<D>` owns one square FP32 state as a nested `std::array`.
-Its `update_reference` and `update_sme` methods process one token and return the output through a `std::array` argument.
-Both update the state in place:
+`gdn_head<D>` owns one square FP32 state as a nested `std::array`. Its `update_reference` and
+`update_sme` methods process one token and return the output through a `std::array` argument. Both
+update the state in place:
 
 ```text
 r      = beta * (v - alpha * transpose(S) * k)
@@ -10,10 +10,9 @@ S      = alpha * S + outer(k, r)
 output = transpose(S) * q
 ```
 
-`alpha` and `beta` are scalar gates, not logits or log-decays.
-The caller supplies key normalization and query scaling.
-State and output must not overlap each other or the input vectors.
-The three read-only vectors may overlap.
+`alpha` and `beta` are scalar gates, not logits or log-decays. The caller supplies key normalization
+and query scaling. State and output must not overlap each other or the input vectors. The three
+read-only vectors may overlap.
 
 ```cpp
 #include "gated_delta.h"
@@ -28,25 +27,41 @@ head.update_reference(q, k, v, 0.99f, 0.5f, output);
 
 ## SME implementation
 
-The kernel uses FP32 throughout. It supports arbitrary positive dimensions and streaming vector lengths, with predicated tails.
-It computes a vector of residuals before modifying the corresponding state columns.
-It then loads decayed state blocks into ZA0.S and applies the correction with `FMOPA`.
-Updated rows supply both the stored state and the output accumulation.
+The kernel uses FP32 throughout. It supports arbitrary positive dimensions and streaming vector
+lengths, with predicated tails. It computes a vector of residuals before modifying the corresponding
+state columns. It then loads decayed state blocks into ZA0.S and applies the correction with
+`FMOPA`. Updated rows supply both the stored state and the output accumulation.
 
-The kernel uses one ZA tile, two state reads, and no scratch arrays.
-It does not include range prefetch or target-specific scheduling.
-This is a correctness baseline, not a measured performance optimization.
+The kernel uses one ZA tile, two state reads, and no scratch arrays. It does not schedule prefetches
+automatically. This is a correctness baseline, not a measured performance optimization.
 Floating-point contraction can cause small differences between implementations.
 
-The SME function requires SME FP32 outer products and OS support for streaming mode and ZA.
-The compiler manages private ZA storage and streaming-mode transitions through ACLE attributes.
-The API has no runtime feature dispatch. Call it only on a supported target.
+Call `next_head.prefetch_sme()` before independent work to hint a later head update. The method
+enters streaming mode and issues `RPRFM PSTKEEP` for nonoverlapping blocks of at most 1 KiB. Each
+hint describes one contiguous block, with an unknown reuse distance. `PSTKEEP` requests
+read-modify-write intent and temporal retention.
+
+```cpp
+next_head.prefetch_sme();
+current_head.update_sme(q, k, v, alpha, beta, output);
+// Later, update next_head with its own inputs.
+```
+
+C1 CME prefetches at most 1 KiB per instruction; a 128-dimensional head needs 64 hints. These hints
+target the memory hierarchy, not ZA, and have no completion guarantee. An implementation without
+FEAT_RPRFM treats the instruction as a NOP. Benchmark the lead time on hardware: a whole-head
+prefetch can evict the current head or exceed prefetch resources. Do not issue another prefetch for
+an overlapping range before consuming the first. The QEMU tests execute the hints but cannot measure
+their cache effect.
+
+The SME function requires SME FP32 outer products and OS support for streaming mode and ZA. The
+compiler manages private ZA storage and streaming-mode transitions through ACLE attributes. The API
+has no runtime feature dispatch. Call it only on a supported target.
 
 ## Build and validate with Nix
 
 The flake pins Nixpkgs and provides an AArch64 cross-compiler, Make, and QEMU user-mode emulation.
-It supports x86-64 and AArch64 Linux hosts.
-From the repository root:
+It supports x86-64 and AArch64 Linux hosts. From the repository root:
 
 ```sh
 nix develop "path:$PWD/examples/gated_delta" \
@@ -61,10 +76,10 @@ nix develop "path:$PWD"
 make check
 ```
 
-The Makefile builds a static AArch64 executable, so QEMU needs no runtime sysroot.
-`make check` enables SME and tests streaming vector lengths of 16, 32, 64, 128, and 256 bytes.
-Use `make check SVL_BYTES=64` to run one length, or `make clean` to remove build outputs.
-QEMU validates instruction behavior, not CME performance or prefetch timing.
+The Makefile builds a static AArch64 executable, so QEMU needs no runtime sysroot. `make check`
+enables SME and tests streaming vector lengths of 16, 32, 64, 128, and 256 bytes. Use
+`make check SVL_BYTES=64` to run one length, or `make clean` to remove build outputs. QEMU validates
+instruction behavior, not CME performance or prefetch timing.
 
 ## Reference-only check
 
@@ -76,6 +91,6 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror \
 /tmp/gated-delta-test
 ```
 
-The tests compare state and output against an independent FP64 recurrence after each update.
-They cover dimensions 1, 3, 16, 17, 32, 65, and 128, repeated updates, and zero/one gate values.
-Do not use `-ffast-math` for these checks.
+The tests compare state and output against an independent FP64 recurrence after each update. They
+cover dimensions 1, 3, 16, 17, 32, 65, and 128, repeated updates, and zero/one gate values. Do not
+use `-ffast-math` for these checks.

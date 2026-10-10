@@ -23,24 +23,50 @@ struct gdn_head {
 
     state_type state{};
 
+    vector_type predict_reference(const vector_type& key) const {
+        vector_type prediction{};
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j)
+                prediction[j] += key[i] * state[i][j];
+        return prediction;
+    }
+
+    void decay_reference(float alpha) {
+        for (auto& row : state)
+            for (float& value : row)
+                value *= alpha;
+    }
+
     void update_reference(const vector_type& q, const vector_type& k,
                           const vector_type& v, float alpha, float beta,
                           vector_type& output) {
-        for (std::size_t j = 0; j < D; ++j) {
-            float prediction = 0.0f;
-            for (std::size_t i = 0; i < D; ++i)
-                prediction += k[i] * state[i][j];
-            const float residual = beta * (v[j] - alpha * prediction);
-            float y = 0.0f;
-            for (std::size_t i = 0; i < D; ++i) {
-                state[i][j] = alpha * state[i][j] + k[i] * residual;
-                y += q[i] * state[i][j];
-            }
-            output[j] = y;
-        }
+        decay_reference(alpha);
+        vector_type residual = predict_reference(k);
+        for (std::size_t j = 0; j < D; ++j)
+            residual[j] = beta * (v[j] - residual[j]);
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j)
+                state[i][j] += k[i] * residual[j];
+        output = predict_reference(q);
     }
 
 #if defined(__ARM_FEATURE_SME)
+    // Hint the state for a later read-modify-write on the CME.
+    // C1 prefetches at most 1 KiB per RPRFM. Timing remains caller-controlled.
+    __arm_locally_streaming
+    void prefetch_sme() const {
+        const auto* base = reinterpret_cast<const unsigned char*>(&state);
+        for (std::size_t offset = 0; offset < sizeof(state); offset += 1024) {
+            const std::size_t remaining = sizeof(state) - offset;
+            // Single contiguous block: count-1, stride, and reuse distance are zero.
+            const uint64_t metadata = remaining < 1024 ? remaining : 1024;
+            asm volatile("rprfm pstkeep, %x[metadata], [%[address]]"
+                         :
+                         : [metadata] "r" (metadata), [address] "r" (base + offset)
+                         : "memory");
+        }
+    }
+
     // Requires SME FP32 outer products and OS support for streaming mode/ZA.
     // The compiler enters streaming mode and manages private ZA state.
     // ponytail: one ZA tile and two state reads; tune residency/prefetch only
