@@ -1,105 +1,107 @@
 #include "gated_delta.h"
 
 #if defined(GATED_DELTA_COMPILE_ONLY)
-// Freestanding cross-compilation checks instantiate the actual SME body.
 #if !defined(__ARM_FEATURE_SME)
 #error "Compile this check for an SME target"
 #endif
-template struct gated_delta::gdn_head<1>;
-template struct gated_delta::gdn_head<17>;
-template struct gated_delta::gdn_head<128>;
+template struct gated_delta::gdn_head<1, gated_delta::sme_float>;
+template struct gated_delta::gdn_head<17, gated_delta::sme_float>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_float>;
 #else
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
 
-static void check(float got, double expected, size_t dimension, unsigned step,
+template <class Scalar>
+static void check(Scalar got, double expected, std::size_t dimension, unsigned step,
                   const char* implementation, const char* field) {
+    constexpr double absolute = std::is_same_v<Scalar, float> ? 3e-5 : 2e-12;
+    constexpr double relative = std::is_same_v<Scalar, float> ? 3e-4 : 2e-12;
     if (!std::isfinite(got) ||
-        std::abs(got - expected) > 3e-5 + 3e-4 * std::abs(expected)) {
-        std::fprintf(stderr, "%s D=%zu step=%u %s: %.9g != %.17g\n",
-                     implementation, dimension, step, field, got, expected);
+        std::abs(got - expected) > absolute + relative * std::abs(expected)) {
+        std::fprintf(stderr, "%s D=%zu step=%u %s: %.17g != %.17g\n",
+                     implementation, dimension, step, field, double(got), expected);
         std::abort();
     }
 }
 
-template <size_t D>
-void run() {
-    using head_type = gated_delta::gdn_head<D>;
-    head_type reference;
+template <std::size_t D, class Backend>
+void run(const char* name) {
+    using head_type = gated_delta::gdn_head<D, Backend>;
+    using scalar_type = typename head_type::scalar_type;
+    head_type head;
     typename head_type::vector_type q{}, k{}, v{}, output{};
     std::array<std::array<double, D>, D> oracle{};
-#if defined(__ARM_FEATURE_SME)
-    head_type actual;
-    typename head_type::vector_type sme_output{};
-#endif
     std::mt19937 random(42 + D);
-    std::uniform_real_distribution<float> sample(-1.0f, 1.0f);
-    for (size_t i = 0; i < D; ++i) {
-        for (size_t j = 0; j < D; ++j) {
-            oracle[i][j] = reference.state[i][j] = sample(random);
-#if defined(__ARM_FEATURE_SME)
-            actual.state[i][j] = reference.state[i][j];
-#endif
+    std::uniform_real_distribution<scalar_type> sample(-1, 1);
+    for (std::size_t i = 0; i < D; ++i)
+        for (std::size_t j = 0; j < D; ++j) {
+            check(head.state[i][j], 0, D, 0, name, "initial state");
+            oracle[i][j] = head.state[i][j] = sample(random);
         }
-    }
+
     for (unsigned step = 0; step < 128; ++step) {
         double norm = 0;
-        for (size_t i = 0; i < D; ++i) {
-            q[i] = sample(random) / std::sqrt(static_cast<float>(D));
+        for (std::size_t i = 0; i < D; ++i) {
+            q[i] = sample(random) / std::sqrt(static_cast<scalar_type>(D));
             k[i] = sample(random);
             v[i] = sample(random);
             norm += static_cast<double>(k[i]) * k[i];
         }
-        for (float& x : k)
-            x = static_cast<float>(x / std::sqrt(norm));
+        for (auto& x : k)
+            x = static_cast<scalar_type>(x / std::sqrt(norm));
         // Include no decay, complete decay, no correction, and full correction.
-        const float alpha = step % 11 == 0 ? 0.0f :
-                            step % 3 == 0 ? 1.0f : 0.97f;
-        const float beta = step % 7 == 0 ? 0.0f :
-                           step % 5 == 0 ? 1.0f : 0.6f;
+        const scalar_type alpha = step % 11 == 0 ? 0 :
+                                  step % 3 == 0 ? 1 : scalar_type(0.97);
+        const scalar_type beta = step % 7 == 0 ? 0 :
+                                 step % 5 == 0 ? 1 : scalar_type(0.6);
 
-        // Independent FP64 oracle: decay, predict, correct, then read output.
+        // Independent FP64 oracle; do not call the generic head implementation.
         std::array<double, D> prediction{}, expected{};
-        for (size_t i = 0; i < D; ++i)
-            for (size_t j = 0; j < D; ++j) {
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j) {
                 oracle[i][j] *= alpha;
                 prediction[j] += k[i] * oracle[i][j];
             }
-        for (size_t i = 0; i < D; ++i)
-            for (size_t j = 0; j < D; ++j) {
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j) {
                 oracle[i][j] += k[i] * (beta * (v[j] - prediction[j]));
                 expected[j] += q[i] * oracle[i][j];
             }
 
-        reference.update_reference(q, k, v, alpha, beta, output);
-#if defined(__ARM_FEATURE_SME)
-        actual.prefetch_sme(); // Instruction smoke test, not a timing benchmark.
-        actual.update_sme(q, k, v, alpha, beta, sme_output);
-#endif
-        for (size_t j = 0; j < D; ++j) {
-            check(output[j], expected[j], D, step, "reference", "output");
-#if defined(__ARM_FEATURE_SME)
-            check(sme_output[j], expected[j], D, step, "SME", "output");
-#endif
-            for (size_t i = 0; i < D; ++i) {
-                check(reference.state[i][j], oracle[i][j], D, step, "reference", "state");
-#if defined(__ARM_FEATURE_SME)
-                check(actual.state[i][j], oracle[i][j], D, step, "SME", "state");
-#endif
-            }
+        head.prefetch(); // Instruction smoke test, not a timing benchmark.
+        head.update(q, k, v, alpha, beta, output);
+        const head_type& const_head = head;
+        const auto predicted = const_head.predict(q);
+        for (std::size_t j = 0; j < D; ++j) {
+            check(output[j], expected[j], D, step, name, "output");
+            check(predicted[j], expected[j], D, step, name, "prediction");
+            for (std::size_t i = 0; i < D; ++i)
+                check(head.state[i][j], oracle[i][j], D, step, name, "state");
         }
     }
+    head.decay(scalar_type(0.5));
+    for (std::size_t i = 0; i < D; ++i)
+        for (std::size_t j = 0; j < D; ++j)
+            check(head.state[i][j], 0.5 * oracle[i][j], D, 128, name, "decay");
+}
+
+template <class Backend>
+void run_dimensions(const char* name) {
+    run<1, Backend>(name); run<3, Backend>(name); run<16, Backend>(name);
+    run<17, Backend>(name); run<32, Backend>(name); run<65, Backend>(name);
+    run<128, Backend>(name);
+    std::printf("PASS: %s update/predict/decay/prefetch against independent FP64 oracle\n", name);
 }
 
 int main() {
-    run<1>(); run<3>(); run<16>(); run<17>();
-    run<32>(); run<65>(); run<128>();
+    run_dimensions<float>("float");
+    run_dimensions<double>("double");
 #if defined(__ARM_FEATURE_SME)
-    std::puts("PASS: reference and SME against FP64 oracle");
+    run_dimensions<gated_delta::sme_float>("sme_float");
 #else
-    std::puts("PASS: reference against FP64 oracle; SME not enabled");
+    std::puts("SME not enabled");
 #endif
 }
 #endif

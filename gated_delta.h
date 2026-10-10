@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <type_traits>
 
 #if defined(__ARM_FEATURE_SME)
 #include <arm_sme.h>
@@ -9,21 +10,26 @@
 
 namespace gated_delta {
 
+// Backend tag: the SME specialization stores float, not wrapped scalar values.
+struct sme_float {};
+
 // One token, one square head. State uses [key][value] row-major order.
 // r = beta * (v - alpha * S^T k)
 // S = alpha * S + k r^T; output = S^T q
-// Inputs are finite FP32 values. The caller supplies scalar gates,
-// key normalization, and query scaling. State and output must not overlap
-// each other or q, k, v. The three read-only inputs may overlap.
-template <std::size_t D>
+// Inputs are finite. The caller supplies scalar gates, key normalization,
+// and query scaling. State and output must not overlap each other or q, k, v.
+// The three read-only inputs may overlap.
+template <std::size_t D, class Scalar = float>
 struct gdn_head {
     static_assert(D > 0, "A head must have at least one dimension");
-    using vector_type = std::array<float, D>;
+    static_assert(std::is_floating_point_v<Scalar>, "Use a floating-point scalar or an SME specialization");
+    using scalar_type = Scalar;
+    using vector_type = std::array<scalar_type, D>;
     using state_type = std::array<vector_type, D>;
 
     state_type state{};
 
-    vector_type predict_reference(const vector_type& key) const {
+    vector_type predict(const vector_type& key) const {
         vector_type prediction{};
         for (std::size_t i = 0; i < D; ++i)
             for (std::size_t j = 0; j < D; ++j)
@@ -31,30 +37,45 @@ struct gdn_head {
         return prediction;
     }
 
-    void decay_reference(float alpha) {
+    void decay(scalar_type alpha) {
         for (auto& row : state)
-            for (float& value : row)
+            for (scalar_type& value : row)
                 value *= alpha;
     }
 
-    void update_reference(const vector_type& q, const vector_type& k,
-                          const vector_type& v, float alpha, float beta,
-                          vector_type& output) {
-        decay_reference(alpha);
-        vector_type residual = predict_reference(k);
+    // No portable range-prefetch operation; scalar backends leave this as a hint.
+    void prefetch() const noexcept {}
+
+    void update(const vector_type& q, const vector_type& k,
+                const vector_type& v, scalar_type alpha, scalar_type beta,
+                vector_type& output) {
+        decay(alpha);
+        vector_type residual = predict(k);
         for (std::size_t j = 0; j < D; ++j)
             residual[j] = beta * (v[j] - residual[j]);
         for (std::size_t i = 0; i < D; ++i)
             for (std::size_t j = 0; j < D; ++j)
                 state[i][j] += k[i] * residual[j];
-        output = predict_reference(q);
+        output = predict(q);
     }
+};
+
+// Incomplete on non-SME targets: selecting this backend must not silently fall back.
+template <std::size_t D>
+struct gdn_head<D, sme_float>;
 
 #if defined(__ARM_FEATURE_SME)
+template <std::size_t D>
+struct gdn_head<D, sme_float> : gdn_head<D, float> {
+    using base_type = gdn_head<D, float>;
+    using typename base_type::vector_type;
+    using base_type::state;
+
+    // Standalone predict/decay reuse the scalar methods; update remains fused.
     // Hint the state for a later read-modify-write on the CME.
     // C1 prefetches at most 1 KiB per RPRFM. Timing remains caller-controlled.
     __arm_locally_streaming
-    void prefetch_sme() const {
+    void prefetch() const noexcept {
         const auto* base = reinterpret_cast<const unsigned char*>(&state);
         for (std::size_t offset = 0; offset < sizeof(state); offset += 1024) {
             const std::size_t remaining = sizeof(state) - offset;
@@ -72,7 +93,7 @@ struct gdn_head {
     // ponytail: one ZA tile and two state reads; tune residency/prefetch only
     // after measuring this kernel on the target CPU or CME.
     __arm_locally_streaming __arm_new("za")
-    void update_sme(const vector_type& q, const vector_type& k,
+    void update(const vector_type& q, const vector_type& k,
                     const vector_type& v, float alpha, float beta,
                     vector_type& output) {
         const std::size_t lanes = svcntw(); // Streaming length, not normal VL.
@@ -118,7 +139,7 @@ struct gdn_head {
             svst1_f32(columns, output.data() + col, y);
         }
     }
-#endif
 };
+#endif
 
 } // namespace gated_delta
