@@ -4,9 +4,12 @@
 #if !defined(__ARM_FEATURE_SME)
 #error "Compile this check for an SME target"
 #endif
-template struct gated_delta::gdn_head<1, gated_delta::sme_float>;
-template struct gated_delta::gdn_head<17, gated_delta::sme_float>;
-template struct gated_delta::gdn_head<128, gated_delta::sme_float>;
+template struct gated_delta::gdn_head<1, gated_delta::sme_matrix_float>;
+template struct gated_delta::gdn_head<17, gated_delta::sme_matrix_float>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_matrix_float>;
+template struct gated_delta::gdn_head<1, gated_delta::sme_vector_float>;
+template struct gated_delta::gdn_head<17, gated_delta::sme_vector_float>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_vector_float>;
 #else
 #include <cmath>
 #include <cstdio>
@@ -99,7 +102,8 @@ int main() {
     run_dimensions<float>("float");
     run_dimensions<double>("double");
 #if defined(__ARM_FEATURE_SME)
-    run_dimensions<gated_delta::sme_float>("sme_float");
+    run_dimensions<gated_delta::sme_matrix_float>("sme_matrix_float");
+    run_dimensions<gated_delta::sme_vector_float>("sme_vector_float");
 #else
     std::puts("SME not enabled");
 #endif
