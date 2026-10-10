@@ -24,6 +24,15 @@ struct sme_matrix_float {};
 // Standalone predict() and decay() still use the non-streaming reference code.
 struct sme_vector_float {};
 
+// Selects a streaming-vector update that handles B adjacent vectors per block.
+// B counts vectors, not elements: on C1, B=4 covers 64 value columns.
+// Supports 1 through 4 vectors and reuses each key/query load across the block.
+// State remains FP32; prediction/decay and prefetch follow sme_vector_float.
+template <std::size_t B>
+struct sme_blocked_float {
+    static_assert(B >= 1 && B <= 4, "A block must contain 1 through 4 streaming vectors");
+};
+
 // Stores the recurrent memory for one Gated DeltaNet head in one sequence.
 // Keep this object between tokens. Each update() call processes the next token
 // and changes the memory used by subsequent calls.
@@ -113,6 +122,8 @@ template <std::size_t D>
 struct gdn_head<D, sme_matrix_float>;
 template <std::size_t D>
 struct gdn_head<D, sme_vector_float>;
+template <std::size_t D, std::size_t B>
+struct gdn_head<D, sme_blocked_float<B>>;
 
 #if defined(__ARM_FEATURE_SME)
 template <std::size_t D>
@@ -228,6 +239,104 @@ struct gdn_head<D, sme_vector_float> : gdn_head<D, sme_matrix_float> {
                 y = svmla_n_f32_m(columns, y, s, q[i]);
             }
             svst1_f32(columns, output.data() + col, y);
+        }
+    }
+};
+
+template <std::size_t D, std::size_t B>
+struct gdn_head<D, sme_blocked_float<B>> : gdn_head<D, sme_vector_float> {
+    static_assert(B >= 1 && B <= 4, "A block must contain 1 through 4 streaming vectors");
+    using base_type = gdn_head<D, sme_vector_float>;
+    using typename base_type::vector_type;
+    using base_type::state;
+
+private:
+    // SVE vectors cannot be array elements. These helpers unroll constant tuple
+    // indices without capturing sizeless vectors in lambdas, which crashes GCC 15.
+    template <std::size_t I = 0>
+    __attribute__((always_inline))
+    static inline svfloat32x4_t predict_row(svfloat32x4_t acc, const vector_type& row,
+                                            std::size_t col, std::size_t lanes,
+                                            svfloat32_t key) __arm_streaming {
+        const std::size_t column = col + I * lanes;
+        const svbool_t pg = svwhilelt_b32_u64(column, D);
+        // All-false vectors use a legal one-past-the-end pointer.
+        const std::size_t offset = column < D ? column : D;
+        const svfloat32_t s = svld1_f32(pg, row.data() + offset);
+        acc = svset4_f32(acc, I, svmla_f32_m(pg, svget4_f32(acc, I), s, key));
+        if constexpr (I + 1 < B)
+            return predict_row<I + 1>(acc, row, col, lanes, key);
+        return acc;
+    }
+
+    template <std::size_t I = 0>
+    __attribute__((always_inline))
+    static inline svfloat32x4_t make_residual(svfloat32x4_t acc, const vector_type& v,
+                                             std::size_t col, std::size_t lanes,
+                                             float alpha, float beta) __arm_streaming {
+        const std::size_t column = col + I * lanes;
+        const svbool_t pg = svwhilelt_b32_u64(column, D);
+        const std::size_t offset = column < D ? column : D;
+        const svfloat32_t prediction = svmul_n_f32_x(pg, svget4_f32(acc, I), alpha);
+        const svfloat32_t error = svsub_f32_x(pg, svld1_f32(pg, v.data() + offset), prediction);
+        acc = svset4_f32(acc, I, svmul_n_f32_x(pg, error, beta));
+        if constexpr (I + 1 < B)
+            return make_residual<I + 1>(acc, v, col, lanes, alpha, beta);
+        return acc;
+    }
+
+    template <std::size_t I = 0>
+    __attribute__((always_inline))
+    static inline svfloat32x4_t update_row(svfloat32x4_t y, vector_type& row,
+                                          svfloat32x4_t residual, std::size_t col,
+                                          std::size_t lanes, float alpha,
+                                          svfloat32_t key, svfloat32_t query) __arm_streaming {
+        const std::size_t column = col + I * lanes;
+        const svbool_t pg = svwhilelt_b32_u64(column, D);
+        const std::size_t offset = column < D ? column : D;
+        svfloat32_t s = svmul_n_f32_x(pg, svld1_f32(pg, row.data() + offset), alpha);
+        s = svmla_f32_m(pg, s, svget4_f32(residual, I), key);
+        svst1_f32(pg, row.data() + offset, s);
+        y = svset4_f32(y, I, svmla_f32_m(pg, svget4_f32(y, I), s, query));
+        if constexpr (I + 1 < B)
+            return update_row<I + 1>(y, row, residual, col, lanes, alpha, key, query);
+        return y;
+    }
+
+    template <std::size_t I = 0>
+    __attribute__((always_inline))
+    static inline void store_output(vector_type& output, svfloat32x4_t y,
+                                    std::size_t col, std::size_t lanes) __arm_streaming {
+        const std::size_t column = col + I * lanes;
+        const svbool_t pg = svwhilelt_b32_u64(column, D);
+        const std::size_t offset = column < D ? column : D;
+        svst1_f32(pg, output.data() + offset, svget4_f32(y, I));
+        if constexpr (I + 1 < B)
+            store_output<I + 1>(output, y, col, lanes);
+    }
+
+public:
+    // B adjacent vectors share each key/query broadcast and row-loop iteration.
+    // The two state passes preserve each output element's accumulation order.
+    __arm_locally_streaming
+    void update(const vector_type& q, const vector_type& k,
+                const vector_type& v, float alpha, float beta,
+                vector_type& output) {
+        const std::size_t lanes = svcntw();
+        const svfloat32_t zero = svdup_f32(0.0f);
+        for (std::size_t col = 0; col < D; col += B * lanes) {
+            svfloat32x4_t residual = svcreate4_f32(zero, zero, zero, zero);
+            for (std::size_t row = 0; row < D; ++row)
+                residual = predict_row(residual, state[row], col, lanes, svdup_f32(k[row]));
+            residual = make_residual(residual, v, col, lanes, alpha, beta);
+
+            svfloat32x4_t y = svcreate4_f32(zero, zero, zero, zero);
+            for (std::size_t row = 0; row < D; ++row) {
+                const svfloat32_t key = svdup_f32(k[row]);
+                const svfloat32_t query = svdup_f32(q[row]);
+                y = update_row(y, state[row], residual, col, lanes, alpha, key, query);
+            }
+            store_output(output, y, col, lanes);
         }
     }
 };

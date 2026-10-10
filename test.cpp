@@ -10,6 +10,10 @@ template struct gated_delta::gdn_head<128, gated_delta::sme_matrix_float>;
 template struct gated_delta::gdn_head<1, gated_delta::sme_vector_float>;
 template struct gated_delta::gdn_head<17, gated_delta::sme_vector_float>;
 template struct gated_delta::gdn_head<128, gated_delta::sme_vector_float>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_blocked_float<1>>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_blocked_float<2>>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_blocked_float<3>>;
+template struct gated_delta::gdn_head<128, gated_delta::sme_blocked_float<4>>;
 #else
 #include <cmath>
 #include <cstdio>
@@ -104,6 +108,10 @@ int main() {
 #if defined(__ARM_FEATURE_SME)
     run_dimensions<gated_delta::sme_matrix_float>("sme_matrix_float");
     run_dimensions<gated_delta::sme_vector_float>("sme_vector_float");
+    run_dimensions<gated_delta::sme_blocked_float<1>>("sme_blocked_float<1>");
+    run_dimensions<gated_delta::sme_blocked_float<2>>("sme_blocked_float<2>");
+    run_dimensions<gated_delta::sme_blocked_float<3>>("sme_blocked_float<3>");
+    run_dimensions<gated_delta::sme_blocked_float<4>>("sme_blocked_float<4>");
 #else
     std::puts("SME not enabled");
 #endif

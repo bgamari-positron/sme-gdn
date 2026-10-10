@@ -73,6 +73,7 @@ All implementations use the same methods and argument layout:
 | `double`              | The same reference code with FP64 state.                             |
 | `sme_matrix_float`    | FP32 update using SME matrix instructions and ZA storage.            |
 | `sme_vector_float`    | FP32 update using streaming vector instructions, without ZA storage. |
+| `sme_blocked_float<B>` | FP32 streaming-vector update that processes B adjacent vectors together (1–4). |
 
 For example, select the vector implementation with `gdn_head<128, gated_delta::sme_vector_float>`.
 
@@ -94,9 +95,9 @@ when you need a normal token update; its output already contains the query reado
 
 ## SME implementation
 
-`sme_matrix_float` is a backend tag, not a scalar wrapper. Its specialization inherits FP32 state, types,
-prediction, and decay from the generic float head. It overrides `update` with the fused SME kernel
-and `prefetch` with range hints. There are no virtual functions or runtime backend dispatch.
+`sme_matrix_float` is a backend tag, not a scalar wrapper. Its specialization inherits FP32 state,
+types, prediction, and decay from the generic float head. It overrides `update` with the fused SME
+kernel and `prefetch` with range hints. There are no virtual functions or runtime backend dispatch.
 Selecting `sme_matrix_float` on a non-SME compilation target fails to compile.
 
 The fused kernel uses FP32 throughout and handles arbitrary positive dimensions with predicated
@@ -110,11 +111,36 @@ Floating-point contraction and decay ordering can cause small differences betwee
 
 Both SME backends require hardware and OS support for streaming mode. The ZA-based backend also uses
 SME FP32 outer products and private ZA storage. `sme_vector_float` inherits state and prefetch
-behavior from `sme_matrix_float`, but replaces the update with streaming vector FMAs. It reads the state
-twice and writes it once, without ZA allocation, slice transfers, or `FMOPA`. Selecting either SME
-backend on a non-SME compilation target fails to compile. Standalone prediction and decay use the
-inherited non-streaming scalar implementation. Calling them separately adds state traffic and can
-cause CPU/CME coherence overhead; prefer the fused update when applicable.
+behavior from `sme_matrix_float`, but replaces the update with streaming vector FMAs. It reads the
+state twice and writes it once, without ZA allocation, slice transfers, or `FMOPA`. Selecting either
+SME backend on a non-SME compilation target fails to compile. Standalone prediction and decay use
+the inherited non-streaming scalar implementation. Calling them separately adds state traffic and
+can cause CPU/CME coherence overhead; prefer the fused update when applicable.
+
+## Blocked streaming-vector implementation
+
+Select a block size at compile time:
+
+```cpp
+using Head = gated_delta::gdn_head<128, gated_delta::sme_blocked_float<4>>;
+```
+
+`B` counts adjacent streaming vectors, not scalar elements.
+Each vector contains `svcntw()` floats; on C1's 512-bit streaming engine, this is 16 floats.
+Thus `B=1`, `2`, `3`, or `4` processes 16, 32, 48, or 64 value columns per block on C1.
+Other streaming vector lengths work without recompilation, and predicates handle incomplete final vectors and blocks.
+
+The prediction loop loads each key component once and reuses it across B independent prediction vectors.
+The correction loop likewise shares each key and query load across B state vectors.
+Each output element still accumulates state rows in the original order.
+The update uses no ZA state and retains two state reads and one state write.
+It inherits scalar prediction/decay and range prefetch from the other SME backends.
+
+The implementation uses four-vector SVE tuples, with compile-time indices selecting the active vectors.
+This limits B to 1–4. Small inline template helpers let the compiler unroll the tuple operations.
+The helpers avoid a GCC 15 compiler crash encountered with streaming lambdas.
+The checked GCC D=128 builds contain no helper calls or vector spills for any supported block size.
+Hardware measurements must determine the best block size; QEMU does not establish a speedup.
 
 ## Prefetching
 
@@ -154,7 +180,7 @@ make check
 ```
 
 The Makefile builds a static AArch64 executable, so QEMU needs no runtime sysroot. `make check`
-tests all four backends at streaming vector lengths of 16, 32, 64, 128, and 256 bytes. Use
+tests all backends, including block sizes 1–4, at streaming vector lengths of 16, 32, 64, 128, and 256 bytes. Use
 `make check SVL_BYTES=64` to run one length, or `make clean` to remove build outputs. QEMU validates
 instruction behavior, not CME performance or prefetch timing.
 
