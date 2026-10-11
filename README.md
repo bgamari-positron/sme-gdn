@@ -168,6 +168,51 @@ operations. The helpers avoid a GCC 15 compiler crash encountered with streaming
 checked GCC D=128 builds contain no helper calls or vector spills for any supported block size.
 Hardware measurements must determine the best block size; QEMU does not establish a speedup.
 
+## Updating several heads in one streaming region
+
+`update_batch()` processes one token for each head in an array.
+All heads in a batch have the same dimension and backend.
+Queries, keys, values, gates, and outputs are parallel arrays: element `i` belongs to head `i`.
+
+```cpp
+using Head = gated_delta::gdn_head<128, gated_delta::sme_blocked_float<4>>;
+constexpr std::size_t count = 3;
+std::array<Head, count> heads{};
+std::array<Head::vector_type, count> q{}, k{}, v{}, output{};
+std::array<Head::scalar_type, count> alpha{}, beta{};
+alpha.fill(0.99f);
+beta.fill(0.5f);
+for (std::size_t i = 0; i < count; ++i) {
+    q[i][0] = k[i][0] = 1.0f;
+    v[i][0] = float(i + 1);
+}
+gated_delta::update_batch(heads.data(), q.data(), k.data(), v.data(),
+                         alpha.data(), beta.data(), output.data(), count);
+// After this first update, output[i][0] is 0.5 * (i + 1).
+// Keep heads between tokens and supply the next token's input arrays.
+```
+
+Every pointer must address at least `count` elements, with the same non-overlap requirements as a single-head update.
+A zero count is a no-op, and all pointers may be null in that case.
+The function also accepts storage supplied by `std::vector` or another contiguous container.
+
+For SME backends, the batch enters streaming mode once and returns to the caller's mode after all heads finish.
+The matrix backend allocates one private ZA context for the batch.
+Vector and blocked backends do not allocate ZA.
+For float and double, the function calls the generic update for each head without entering streaming mode.
+The batch does not issue prefetch hints automatically.
+
+SME heads also expose `update_streaming()` and `prefetch_streaming()` for custom streaming loops.
+Call these from a function declared with the appropriate ACLE streaming attributes, not from ordinary non-streaming code.
+The matrix `update_streaming()` additionally requires the caller to provide active ZA via ACLE attributes and uses it as scratch.
+Vector updates and prefetches do not use ZA.
+Existing `update()` and `prefetch()` methods remain the ordinary, single-head entry points.
+Their mode-changing wrappers are deliberately out of line to avoid GCC 15 streaming-inlining failures.
+
+The tests compare batches of zero through three heads against individual calls, including untouched heads beyond the requested count.
+They cover both 17- and 128-dimensional state and execute streaming prefetch calls separately.
+The current benchmark still measures individual calls; it does not measure the batching benefit.
+
 ## Prefetching
 
 For an SME head, call `next_head.prefetch()` before independent work to hint a later update. The

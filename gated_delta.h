@@ -65,6 +65,8 @@ struct gdn_head {
     static_assert(D > 0, "A head must have at least one dimension");
     static_assert(std::is_floating_point_v<Scalar>, "Use a floating-point scalar or an SME specialization");
     using scalar_type = Scalar;
+    static constexpr bool uses_sme = false;
+    static constexpr bool uses_za = false;
     using vector_type = std::array<scalar_type, D>;
     using state_type = std::array<vector_type, D>;
 
@@ -126,17 +128,29 @@ template <std::size_t D, std::size_t B>
 struct gdn_head<D, sme_blocked_float<B>>;
 
 #if defined(__ARM_FEATURE_SME)
+// Keep mode-changing wrappers out of line: GCC 15 can lose streaming context
+// when it inlines them into non-streaming callers. Streaming entry points inline
+// within a batch so that there is no mode switch or function call per head.
 template <std::size_t D>
 struct gdn_head<D, sme_matrix_float> : gdn_head<D, float> {
     using base_type = gdn_head<D, float>;
     using typename base_type::vector_type;
     using base_type::state;
+    static constexpr bool uses_sme = true;
+    static constexpr bool uses_za = true;
 
     // Standalone predict/decay reuse the scalar methods; update remains fused.
     // Hint the state for a later read-modify-write on the CME.
     // C1 prefetches at most 1 KiB per RPRFM. Timing remains caller-controlled.
     __arm_locally_streaming
+    __attribute__((noinline))
     void prefetch() const noexcept {
+        prefetch_streaming();
+    }
+
+    // For callers already in streaming mode; does not allocate or change ZA.
+    __attribute__((always_inline))
+    void prefetch_streaming() const noexcept __arm_streaming {
         const auto* base = reinterpret_cast<const unsigned char*>(&state);
         for (std::size_t offset = 0; offset < sizeof(state); offset += 1024) {
             const std::size_t remaining = sizeof(state) - offset;
@@ -154,9 +168,17 @@ struct gdn_head<D, sme_matrix_float> : gdn_head<D, float> {
     // ponytail: one ZA tile and two state reads; tune residency/prefetch only
     // after measuring this kernel on the target CPU or CME.
     __arm_locally_streaming __arm_new("za")
+    __attribute__((noinline))
     void update(const vector_type& q, const vector_type& k,
-                    const vector_type& v, float alpha, float beta,
-                    vector_type& output) {
+                const vector_type& v, float alpha, float beta, vector_type& output) {
+        update_streaming(q, k, v, alpha, beta, output);
+    }
+
+    // Uses the caller's active ZA as scratch. ZA contents are not preserved.
+    __attribute__((always_inline))
+    void update_streaming(const vector_type& q, const vector_type& k,
+                          const vector_type& v, float alpha, float beta,
+                          vector_type& output) __arm_streaming __arm_inout("za") {
         const std::size_t lanes = svcntw(); // Streaming length, not normal VL.
         const svfloat32_t zero = svdup_f32(0.0f);
 
@@ -208,12 +230,21 @@ struct gdn_head<D, sme_vector_float> : gdn_head<D, sme_matrix_float> {
     using base_type = gdn_head<D, sme_matrix_float>;
     using typename base_type::vector_type;
     using base_type::state;
+    static constexpr bool uses_za = false;
 
     // Two state reads and one write, with no ZA allocation or slice transfers.
     __arm_locally_streaming
+    __attribute__((noinline))
     void update(const vector_type& q, const vector_type& k,
-                const vector_type& v, float alpha, float beta,
-                vector_type& output) {
+                const vector_type& v, float alpha, float beta, vector_type& output) {
+        update_streaming(q, k, v, alpha, beta, output);
+    }
+
+    // Streaming entry point for batches; does not use ZA.
+    __attribute__((always_inline))
+    void update_streaming(const vector_type& q, const vector_type& k,
+                          const vector_type& v, float alpha, float beta,
+                          vector_type& output) __arm_streaming {
         const std::size_t lanes = svcntw();
         const svfloat32_t zero = svdup_f32(0.0f);
 
@@ -440,9 +471,17 @@ public:
     // Full two/four-vector blocks use SME2 grouped loads when available.
     // Tails and SME1 builds retain predicated single-vector loads.
     __arm_locally_streaming
+    __attribute__((noinline))
     void update(const vector_type& q, const vector_type& k,
-                const vector_type& v, float alpha, float beta,
-                vector_type& output) {
+                const vector_type& v, float alpha, float beta, vector_type& output) {
+        update_streaming(q, k, v, alpha, beta, output);
+    }
+
+    // Streaming entry point for batches; does not use ZA.
+    __attribute__((always_inline))
+    void update_streaming(const vector_type& q, const vector_type& k,
+                          const vector_type& v, float alpha, float beta,
+                          vector_type& output) __arm_streaming {
         const std::size_t lanes = svcntw();
         for (std::size_t col = 0; col < D; col += B * lanes) {
 #if defined(__ARM_FEATURE_SME2)
@@ -471,6 +510,60 @@ public:
         }
     }
 };
+
+namespace detail {
+
+// Matrix batches create one private ZA context for all heads.
+template <class Head>
+__arm_new("za")
+void matrix_batch(Head* heads, const typename Head::vector_type* q,
+                  const typename Head::vector_type* k, const typename Head::vector_type* v,
+                  const typename Head::scalar_type* alpha, const typename Head::scalar_type* beta,
+                  typename Head::vector_type* output, std::size_t count) __arm_streaming {
+    for (std::size_t i = 0; i < count; ++i)
+        heads[i].update_streaming(q[i], k[i], v[i], alpha[i], beta[i], output[i]);
+}
+
+template <class Head>
+__arm_locally_streaming
+__attribute__((noinline))
+void streaming_batch(Head* heads, const typename Head::vector_type* q,
+                     const typename Head::vector_type* k, const typename Head::vector_type* v,
+                     const typename Head::scalar_type* alpha, const typename Head::scalar_type* beta,
+                     typename Head::vector_type* output, std::size_t count) {
+    if constexpr (Head::uses_za) {
+        matrix_batch(heads, q, k, v, alpha, beta, output, count);
+    } else {
+        for (std::size_t i = 0; i < count; ++i)
+            heads[i].update_streaming(q[i], k[i], v[i], alpha[i], beta[i], output[i]);
+    }
+}
+
+} // namespace detail
 #endif
+
+// Process one token for each of count independent heads, in array order.
+// Every pointer must address count elements. State and output arrays must not
+// overlap any input array or each other; the read-only input arrays may overlap.
+// With count=0, pointers may be null; the function returns without accessing them.
+// SME backends enter streaming mode once; vector backends do not allocate ZA.
+// Matrix batches allocate ZA once. No prefetch is issued automatically.
+template <class Head>
+void update_batch(Head* heads, const typename Head::vector_type* q,
+                  const typename Head::vector_type* k, const typename Head::vector_type* v,
+                  const typename Head::scalar_type* alpha, const typename Head::scalar_type* beta,
+                  typename Head::vector_type* output, std::size_t count) {
+    if (count == 0)
+        return;
+#if defined(__ARM_FEATURE_SME)
+    if constexpr (Head::uses_sme) {
+        detail::streaming_batch(heads, q, k, v, alpha, beta, output, count);
+    } else
+#endif
+    {
+        for (std::size_t i = 0; i < count; ++i)
+            heads[i].update(q[i], k[i], v[i], alpha[i], beta[i], output[i]);
+    }
+}
 
 } // namespace gated_delta

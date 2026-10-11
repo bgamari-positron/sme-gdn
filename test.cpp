@@ -94,12 +94,72 @@ void run(const char* name) {
             check(head.state[i][j], 0.5 * oracle[i][j], D, 128, name, "decay");
 }
 
+#if defined(__ARM_FEATURE_SME)
+template <class Head>
+__arm_locally_streaming __attribute__((noinline))
+void prefetch_batch_probe(Head* heads, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i)
+        heads[i].prefetch_streaming();
+}
+#endif
+
+template <std::size_t D, class Backend>
+void run_batch(const char* name) {
+    using head_type = gated_delta::gdn_head<D, Backend>;
+    using scalar_type = typename head_type::scalar_type;
+    constexpr std::size_t capacity = 3;
+    std::array<head_type, capacity> batched{}, individual{};
+    std::array<typename head_type::vector_type, capacity> q{}, k{}, v{}, got{}, expected{};
+    std::array<scalar_type, capacity> alpha{}, beta{};
+    std::mt19937 random(123 + D);
+    std::uniform_real_distribution<float> sample(-1, 1);
+    gated_delta::update_batch<head_type>(nullptr, nullptr, nullptr, nullptr,
+                                        nullptr, nullptr, nullptr, 0);
+    for (std::size_t h = 0; h < capacity; ++h) {
+        got[h].fill(-99);
+        expected[h].fill(-99);
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j)
+                batched[h].state[i][j] = individual[h].state[i][j] = sample(random);
+    }
+    for (unsigned step = 0; step < 12; ++step) {
+        const std::size_t count = step % (capacity + 1);
+        for (std::size_t h = 0; h < capacity; ++h) {
+            alpha[h] = (step + h) % 3 == 0 ? 0 : scalar_type(0.97);
+            beta[h] = (step + h) % 4 == 0 ? 0 : scalar_type(0.6);
+            for (std::size_t i = 0; i < D; ++i) {
+                q[h][i] = sample(random) / std::sqrt(scalar_type(D));
+                k[h][i] = sample(random) / std::sqrt(scalar_type(D));
+                v[h][i] = sample(random);
+            }
+        }
+#if defined(__ARM_FEATURE_SME)
+        if constexpr (head_type::uses_sme)
+            prefetch_batch_probe(batched.data(), count);
+#endif
+        for (std::size_t h = 0; h < count; ++h)
+            individual[h].update(q[h], k[h], v[h], alpha[h], beta[h], expected[h]);
+        gated_delta::update_batch(batched.data(), q.data(), k.data(), v.data(),
+                                 alpha.data(), beta.data(), got.data(), count);
+        for (std::size_t h = 0; h < capacity; ++h) {
+            for (std::size_t j = 0; j < D; ++j) {
+                check(got[h][j], expected[h][j], D, step, name, "batch output");
+                for (std::size_t i = 0; i < D; ++i)
+                    check(batched[h].state[i][j], individual[h].state[i][j],
+                          D, step, name, "batch state");
+            }
+        }
+    }
+}
+
 template <class Backend>
 void run_dimensions(const char* name) {
     run<1, Backend>(name); run<3, Backend>(name); run<16, Backend>(name);
     run<17, Backend>(name); run<32, Backend>(name); run<65, Backend>(name);
     run<128, Backend>(name);
-    std::printf("PASS: %s update/predict/decay/prefetch against independent FP64 oracle\n", name);
+    run_batch<17, Backend>(name);
+    run_batch<128, Backend>(name);
+    std::printf("PASS: %s FP64-oracle checks and batched-versus-individual updates\n", name);
 }
 
 int main() {
