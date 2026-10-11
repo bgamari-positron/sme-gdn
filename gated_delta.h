@@ -243,6 +243,126 @@ struct gdn_head<D, sme_vector_float> : gdn_head<D, sme_matrix_float> {
     }
 };
 
+#if defined(__ARM_FEATURE_SME2)
+namespace detail {
+
+__attribute__((always_inline))
+inline svfloat32_t residual_vector(svbool_t pg, svfloat32_t prediction,
+                                  const float* value, float alpha, float beta) __arm_streaming {
+    prediction = svmul_n_f32_x(pg, prediction, alpha);
+    const svfloat32_t error = svsub_f32_x(pg, svld1_f32(pg, value), prediction);
+    return svmul_n_f32_x(pg, error, beta);
+}
+
+__attribute__((always_inline))
+inline svfloat32_t update_vector(svbool_t pg, svfloat32_t previous,
+                                svfloat32_t residual, svfloat32_t key, svfloat32_t query,
+                                float alpha, float* destination, svfloat32_t output) __arm_streaming {
+    svfloat32_t updated = svmul_n_f32_x(pg, previous, alpha);
+    updated = svmla_f32_m(pg, updated, residual, key);
+    svst1_f32(pg, destination, updated);
+    return svmla_f32_m(pg, output, updated, query);
+}
+
+// Full-block kernels are deliberately separate: SVE vectors cannot form arrays,
+// and named accumulators avoid the register copies generated for tuple updates.
+// The caller must ensure that the entire block fits. Both kernels use single-vector stores.
+template <std::size_t D, std::size_t B>
+struct sme_full_block;
+
+template <std::size_t D>
+struct sme_full_block<D, 2> {
+    using head_type = gdn_head<D, float>;
+    using vector_type = typename head_type::vector_type;
+    using state_type = typename head_type::state_type;
+
+    __attribute__((always_inline))
+    static inline void update(state_type& state, const vector_type& q, const vector_type& k,
+                              const vector_type& v, float alpha, float beta,
+                              vector_type& output, std::size_t col, std::size_t lanes) __arm_streaming {
+        const svbool_t pg0 = svwhilelt_b32_u64(col, D);
+        const svbool_t pg1 = svwhilelt_b32_u64(col + lanes, D);
+        const svfloat32_t zero = svdup_f32(0.0f);
+        svfloat32_t r0 = zero, r1 = zero;
+        for (std::size_t row = 0; row < D; ++row) {
+            const svfloat32x2_t values = svld1_f32_x2(svptrue_c32(), state[row].data() + col);
+            const svfloat32_t key = svdup_f32(k[row]);
+            r0 = svmla_f32_m(pg0, r0, svget2_f32(values, 0), key);
+            r1 = svmla_f32_m(pg1, r1, svget2_f32(values, 1), key);
+        }
+        r0 = residual_vector(pg0, r0, v.data() + col, alpha, beta);
+        r1 = residual_vector(pg1, r1, v.data() + col + lanes, alpha, beta);
+
+        svfloat32_t y0 = zero, y1 = zero;
+        for (std::size_t row = 0; row < D; ++row) {
+            const svfloat32x2_t values = svld1_f32_x2(svptrue_c32(), state[row].data() + col);
+            const svfloat32_t key = svdup_f32(k[row]);
+            const svfloat32_t query = svdup_f32(q[row]);
+            float* destination = state[row].data() + col;
+            y0 = update_vector(pg0, svget2_f32(values, 0), r0, key, query, alpha,
+                               destination, y0);
+            y1 = update_vector(pg1, svget2_f32(values, 1), r1, key, query, alpha,
+                               destination + lanes, y1);
+        }
+        svst1_f32(pg0, output.data() + col, y0);
+        svst1_f32(pg1, output.data() + col + lanes, y1);
+    }
+};
+
+template <std::size_t D>
+struct sme_full_block<D, 4> {
+    using head_type = gdn_head<D, float>;
+    using vector_type = typename head_type::vector_type;
+    using state_type = typename head_type::state_type;
+
+    __attribute__((always_inline))
+    static inline void update(state_type& state, const vector_type& q, const vector_type& k,
+                              const vector_type& v, float alpha, float beta,
+                              vector_type& output, std::size_t col, std::size_t lanes) __arm_streaming {
+        const svbool_t pg0 = svwhilelt_b32_u64(col, D);
+        const svbool_t pg1 = svwhilelt_b32_u64(col + lanes, D);
+        const svbool_t pg2 = svwhilelt_b32_u64(col + 2 * lanes, D);
+        const svbool_t pg3 = svwhilelt_b32_u64(col + 3 * lanes, D);
+        const svfloat32_t zero = svdup_f32(0.0f);
+        svfloat32_t r0 = zero, r1 = zero, r2 = zero, r3 = zero;
+        for (std::size_t row = 0; row < D; ++row) {
+            const svfloat32x4_t values = svld1_f32_x4(svptrue_c32(), state[row].data() + col);
+            const svfloat32_t key = svdup_f32(k[row]);
+            r0 = svmla_f32_m(pg0, r0, svget4_f32(values, 0), key);
+            r1 = svmla_f32_m(pg1, r1, svget4_f32(values, 1), key);
+            r2 = svmla_f32_m(pg2, r2, svget4_f32(values, 2), key);
+            r3 = svmla_f32_m(pg3, r3, svget4_f32(values, 3), key);
+        }
+        r0 = residual_vector(pg0, r0, v.data() + col, alpha, beta);
+        r1 = residual_vector(pg1, r1, v.data() + col + lanes, alpha, beta);
+        r2 = residual_vector(pg2, r2, v.data() + col + 2 * lanes, alpha, beta);
+        r3 = residual_vector(pg3, r3, v.data() + col + 3 * lanes, alpha, beta);
+
+        svfloat32_t y0 = zero, y1 = zero, y2 = zero, y3 = zero;
+        for (std::size_t row = 0; row < D; ++row) {
+            const svfloat32x4_t values = svld1_f32_x4(svptrue_c32(), state[row].data() + col);
+            const svfloat32_t key = svdup_f32(k[row]);
+            const svfloat32_t query = svdup_f32(q[row]);
+            float* destination = state[row].data() + col;
+            y0 = update_vector(pg0, svget4_f32(values, 0), r0, key, query, alpha,
+                               destination, y0);
+            y1 = update_vector(pg1, svget4_f32(values, 1), r1, key, query, alpha,
+                               destination + lanes, y1);
+            y2 = update_vector(pg2, svget4_f32(values, 2), r2, key, query, alpha,
+                               destination + 2 * lanes, y2);
+            y3 = update_vector(pg3, svget4_f32(values, 3), r3, key, query, alpha,
+                               destination + 3 * lanes, y3);
+        }
+        svst1_f32(pg0, output.data() + col, y0);
+        svst1_f32(pg1, output.data() + col + lanes, y1);
+        svst1_f32(pg2, output.data() + col + 2 * lanes, y2);
+        svst1_f32(pg3, output.data() + col + 3 * lanes, y3);
+    }
+};
+
+} // namespace detail
+#endif
+
 template <std::size_t D, std::size_t B>
 struct gdn_head<D, sme_blocked_float<B>> : gdn_head<D, sme_vector_float> {
     static_assert(B >= 1 && B <= 4, "A block must contain 1 through 4 streaming vectors");
@@ -253,21 +373,6 @@ struct gdn_head<D, sme_blocked_float<B>> : gdn_head<D, sme_vector_float> {
 private:
     // SVE vectors cannot be array elements. These helpers unroll constant tuple
     // indices without capturing sizeless vectors in lambdas, which crashes GCC 15.
-#if defined(__ARM_FEATURE_SME2)
-    template <std::size_t Width = B>
-    __attribute__((always_inline))
-    static inline svfloat32x4_t load_grouped(const vector_type& row, std::size_t col) __arm_streaming {
-        static_assert(Width == 2 || Width == 4);
-        // The caller selects this path only when all B vectors fit in the row.
-        if constexpr (Width == 4)
-            return svld1_f32_x4(svptrue_c32(), row.data() + col);
-        else {
-            const svfloat32x2_t pair = svld1_f32_x2(svptrue_c32(), row.data() + col);
-            return svcreate4_f32(svget2_f32(pair, 0), svget2_f32(pair, 1),
-                                 svdup_f32(0.0f), svdup_f32(0.0f));
-        }
-    }
-#endif
 
     template <std::size_t I = 0>
     __attribute__((always_inline))
@@ -302,19 +407,6 @@ private:
         return y;
     }
 
-    template <std::size_t I = 0>
-    __attribute__((always_inline))
-    static inline svfloat32x4_t predict_loaded_row(svfloat32x4_t acc, svfloat32x4_t values,
-                                            std::size_t col, std::size_t lanes,
-                                            svfloat32_t key) __arm_streaming {
-        const std::size_t column = col + I * lanes;
-        const svbool_t pg = svwhilelt_b32_u64(column, D);
-        const svfloat32_t s = svget4_f32(values, I);
-        acc = svset4_f32(acc, I, svmla_f32_m(pg, svget4_f32(acc, I), s, key));
-        if constexpr (I + 1 < B)
-            return predict_loaded_row<I + 1>(acc, values, col, lanes, key);
-        return acc;
-    }
 
     template <std::size_t I = 0>
     __attribute__((always_inline))
@@ -332,23 +424,6 @@ private:
         return acc;
     }
 
-    template <std::size_t I = 0>
-    __attribute__((always_inline))
-    static inline svfloat32x4_t update_loaded_row(svfloat32x4_t y, vector_type& row,
-                                          svfloat32x4_t values, svfloat32x4_t residual, std::size_t col,
-                                          std::size_t lanes, float alpha,
-                                          svfloat32_t key, svfloat32_t query) __arm_streaming {
-        const std::size_t column = col + I * lanes;
-        const svbool_t pg = svwhilelt_b32_u64(column, D);
-        const std::size_t offset = column < D ? column : D;
-        svfloat32_t s = svmul_n_f32_x(pg, svget4_f32(values, I), alpha);
-        s = svmla_f32_m(pg, s, svget4_f32(residual, I), key);
-        svst1_f32(pg, row.data() + offset, s);
-        y = svset4_f32(y, I, svmla_f32_m(pg, svget4_f32(y, I), s, query));
-        if constexpr (I + 1 < B)
-            return update_loaded_row<I + 1>(y, row, values, residual, col, lanes, alpha, key, query);
-        return y;
-    }
 
     template <std::size_t I = 0>
     __attribute__((always_inline))
@@ -362,31 +437,6 @@ private:
             store_output<I + 1>(output, y, col, lanes);
     }
 
-#if defined(__ARM_FEATURE_SME2)
-    template <std::size_t Width = B>
-    __attribute__((always_inline))
-    inline void update_grouped_block(const vector_type& q, const vector_type& k,
-                                     const vector_type& v, float alpha, float beta,
-                                     vector_type& output, std::size_t col,
-                                     std::size_t lanes) __arm_streaming {
-        const svfloat32_t zero = svdup_f32(0.0f);
-        svfloat32x4_t residual = svcreate4_f32(zero, zero, zero, zero);
-        for (std::size_t row = 0; row < D; ++row) {
-            const svfloat32x4_t values = load_grouped<Width>(state[row], col);
-            residual = predict_loaded_row(residual, values, col, lanes, svdup_f32(k[row]));
-        }
-        residual = make_residual(residual, v, col, lanes, alpha, beta);
-
-        svfloat32x4_t y = svcreate4_f32(zero, zero, zero, zero);
-        for (std::size_t row = 0; row < D; ++row) {
-            const svfloat32x4_t values = load_grouped<Width>(state[row], col);
-            const svfloat32_t key = svdup_f32(k[row]);
-            const svfloat32_t query = svdup_f32(q[row]);
-            y = update_loaded_row(y, state[row], values, residual, col, lanes, alpha, key, query);
-        }
-        store_output(output, y, col, lanes);
-    }
-#endif
 
 public:
     // B adjacent vectors share each key/query broadcast and row-loop iteration.
@@ -402,7 +452,8 @@ public:
             if constexpr (B == 2 || B == 4) {
                 // Dispatch once per block, not inside the state-row loops.
                 if (D - col >= B * lanes) {
-                    update_grouped_block(q, k, v, alpha, beta, output, col, lanes);
+                    detail::sme_full_block<D, B>::update(
+                        state, q, k, v, alpha, beta, output, col, lanes);
                     continue;
                 }
             }

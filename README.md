@@ -137,24 +137,30 @@ retains two state reads and one state write. It inherits scalar prediction/decay
 from the other SME backends.
 
 With SME2 enabled, full B=2 and B=4 blocks load adjacent state vectors with a single grouped `LD1W`.
-Both the prediction pass and the correction pass use these loads.
-The full-block check runs once per block, outside the state-row loops.
-Incomplete blocks and B=1/3 retain predicated single-vector loads; stores remain single-vector.
-An SME1 compilation uses single-vector loads for every block.
+Both the prediction pass and the correction pass use these loads. The full-block check runs once per
+block, outside the state-row loops. Incomplete blocks and B=1/3 retain predicated single-vector
+loads; stores remain single-vector. An SME1 compilation uses single-vector loads for every block.
 
-The Makefile now targets `-march=armv9-a+sme2`, matching C1's SME2 support.
-The benchmark banner identifies whether grouped loads are compiled in.
-For an SME1 comparison, clean first and rebuild with the older target:
+The Makefile now targets `-march=armv9-a+sme2`, matching C1's SME2 support. The benchmark banner
+identifies whether grouped loads are compiled in. For an SME1 comparison, clean first and rebuild
+with the older target:
 
 ```sh
 make clean
 make benchmark CXXFLAGS='-O3 -g -std=c++17 -march=armv9-a+sme -Wall -Wextra -Werror'
 ```
 
-Run these commands from the example directory inside its Nix shell.
-Clean again before returning to the default SME2 build; Make does not track command-line flag changes.
+Run these commands from the example directory inside its Nix shell. Clean again before returning to
+the default SME2 build; Make does not track command-line flag changes.
 
-The implementation uses four-vector SVE tuples, with compile-time indices selecting the active
+The SME2 full-block paths are separate `detail::sme_full_block<D, 2>` and `detail::sme_full_block<D, 4>` specializations.
+Each spells out its prediction and output accumulators directly, without conditional code for the other width.
+Only the small per-vector arithmetic helpers are shared between them.
+This reduces register copies while keeping both kernels straightforward to read.
+Grouped loads use the matching two- or four-vector SVE tuple; stores remain individual vector stores.
+The public `sme_blocked_float<B>` interface and the generic tail path are unchanged.
+
+The generic tail path uses four-vector SVE tuples, with compile-time indices selecting the active
 vectors. This limits B to 1–4. Small inline template helpers let the compiler unroll the tuple
 operations. The helpers avoid a GCC 15 compiler crash encountered with streaming lambdas. The
 checked GCC D=128 builds contain no helper calls or vector spills for any supported block size.
@@ -213,7 +219,8 @@ nix develop "path:$PWD/examples/gated_delta" \
   --command make -C examples/gated_delta benchmark
 ```
 
-Copy `examples/gated_delta/build/benchmark` to an SME-capable AArch64 system. On that system, run:
+Copy `examples/gated_delta/build/benchmark` to an SME2-capable AArch64 system for the default build.
+On that system, run:
 
 ```sh
 ./benchmark 10000 5
