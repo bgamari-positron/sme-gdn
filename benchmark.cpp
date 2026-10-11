@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
 #if defined(__ARM_FEATURE_SME)
     std::printf("Streaming vector length: %zu bytes\n", streaming_bytes());
 #if defined(__ARM_FEATURE_SME2)
-    std::puts("Blocked kernels: SME2 grouped loads enabled for full B=2/4 blocks.");
+    std::puts("Blocked kernels: SME2 grouped loads/state stores enabled for full B=2/4 blocks.");
 #else
     std::puts("Blocked kernels: SME1 single-vector loads.");
 #endif

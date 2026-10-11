@@ -255,18 +255,15 @@ inline svfloat32_t residual_vector(svbool_t pg, svfloat32_t prediction,
 }
 
 __attribute__((always_inline))
-inline svfloat32_t update_vector(svbool_t pg, svfloat32_t previous,
-                                svfloat32_t residual, svfloat32_t key, svfloat32_t query,
-                                float alpha, float* destination, svfloat32_t output) __arm_streaming {
-    svfloat32_t updated = svmul_n_f32_x(pg, previous, alpha);
-    updated = svmla_f32_m(pg, updated, residual, key);
-    svst1_f32(pg, destination, updated);
-    return svmla_f32_m(pg, output, updated, query);
+inline svfloat32_t correct_vector(svbool_t pg, svfloat32_t previous,
+                                 svfloat32_t residual, svfloat32_t key, float alpha) __arm_streaming {
+    const svfloat32_t decayed = svmul_n_f32_x(pg, previous, alpha);
+    return svmla_f32_x(pg, decayed, residual, key);
 }
 
 // Full-block kernels are deliberately separate: SVE vectors cannot form arrays,
 // and named accumulators avoid the register copies generated for tuple updates.
-// The caller must ensure that the entire block fits. Both kernels use single-vector stores.
+// The caller must ensure that the entire block fits; grouped stores write every lane.
 template <std::size_t D, std::size_t B>
 struct sme_full_block;
 
@@ -298,11 +295,11 @@ struct sme_full_block<D, 2> {
             const svfloat32x2_t values = svld1_f32_x2(svptrue_c32(), state[row].data() + col);
             const svfloat32_t key = svdup_f32(k[row]);
             const svfloat32_t query = svdup_f32(q[row]);
-            float* destination = state[row].data() + col;
-            y0 = update_vector(pg0, svget2_f32(values, 0), r0, key, query, alpha,
-                               destination, y0);
-            y1 = update_vector(pg1, svget2_f32(values, 1), r1, key, query, alpha,
-                               destination + lanes, y1);
+            const svfloat32_t s0 = correct_vector(pg0, svget2_f32(values, 0), r0, key, alpha);
+            const svfloat32_t s1 = correct_vector(pg1, svget2_f32(values, 1), r1, key, alpha);
+            svst1_f32_x2(svptrue_c32(), state[row].data() + col, svcreate2_f32(s0, s1));
+            y0 = svmla_f32_m(pg0, y0, s0, query);
+            y1 = svmla_f32_m(pg1, y1, s1, query);
         }
         svst1_f32(pg0, output.data() + col, y0);
         svst1_f32(pg1, output.data() + col + lanes, y1);
@@ -343,15 +340,15 @@ struct sme_full_block<D, 4> {
             const svfloat32x4_t values = svld1_f32_x4(svptrue_c32(), state[row].data() + col);
             const svfloat32_t key = svdup_f32(k[row]);
             const svfloat32_t query = svdup_f32(q[row]);
-            float* destination = state[row].data() + col;
-            y0 = update_vector(pg0, svget4_f32(values, 0), r0, key, query, alpha,
-                               destination, y0);
-            y1 = update_vector(pg1, svget4_f32(values, 1), r1, key, query, alpha,
-                               destination + lanes, y1);
-            y2 = update_vector(pg2, svget4_f32(values, 2), r2, key, query, alpha,
-                               destination + 2 * lanes, y2);
-            y3 = update_vector(pg3, svget4_f32(values, 3), r3, key, query, alpha,
-                               destination + 3 * lanes, y3);
+            const svfloat32_t s0 = correct_vector(pg0, svget4_f32(values, 0), r0, key, alpha);
+            const svfloat32_t s1 = correct_vector(pg1, svget4_f32(values, 1), r1, key, alpha);
+            const svfloat32_t s2 = correct_vector(pg2, svget4_f32(values, 2), r2, key, alpha);
+            const svfloat32_t s3 = correct_vector(pg3, svget4_f32(values, 3), r3, key, alpha);
+            svst1_f32_x4(svptrue_c32(), state[row].data() + col, svcreate4_f32(s0, s1, s2, s3));
+            y0 = svmla_f32_m(pg0, y0, s0, query);
+            y1 = svmla_f32_m(pg1, y1, s1, query);
+            y2 = svmla_f32_m(pg2, y2, s2, query);
+            y3 = svmla_f32_m(pg3, y3, s3, query);
         }
         svst1_f32(pg0, output.data() + col, y0);
         svst1_f32(pg1, output.data() + col + lanes, y1);

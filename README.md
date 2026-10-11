@@ -139,7 +139,7 @@ from the other SME backends.
 With SME2 enabled, full B=2 and B=4 blocks load adjacent state vectors with a single grouped `LD1W`.
 Both the prediction pass and the correction pass use these loads. The full-block check runs once per
 block, outside the state-row loops. Incomplete blocks and B=1/3 retain predicated single-vector
-loads; stores remain single-vector. An SME1 compilation uses single-vector loads for every block.
+loads and stores. An SME1 compilation uses single-vector loads and stores for every block.
 
 The Makefile now targets `-march=armv9-a+sme2`, matching C1's SME2 support. The benchmark banner
 identifies whether grouped loads are compiled in. For an SME1 comparison, clean first and rebuild
@@ -157,7 +157,9 @@ The SME2 full-block paths are separate `detail::sme_full_block<D, 2>` and `detai
 Each spells out its prediction and output accumulators directly, without conditional code for the other width.
 Only the small per-vector arithmetic helpers are shared between them.
 This reduces register copies while keeping both kernels straightforward to read.
-Grouped loads use the matching two- or four-vector SVE tuple; stores remain individual vector stores.
+Full blocks use matching two- or four-vector SME2 loads and state stores.
+Output stores remain individual: grouping them increased hot-loop register shuffling in the checked GCC build.
+Grouped state stores also require some register copies; hardware measurements must establish whether the reduced store instruction count helps.
 The public `sme_blocked_float<B>` interface and the generic tail path are unchanged.
 
 The generic tail path uses four-vector SVE tuples, with compile-time indices selecting the active
