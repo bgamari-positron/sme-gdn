@@ -186,13 +186,12 @@ struct gdn_head<D, sme_matrix_float> : gdn_head<D, float> {
             const svbool_t columns = svwhilelt_b32_u64(col, D);
             svfloat32_t prediction = zero;
             for (std::size_t i = 0; i < D; ++i) {
-                const svfloat32_t s = svld1_f32(columns, state[i].data() + col);
+                const svfloat32_t s = svmul_n_f32_x(
+                    columns, svld1_f32(columns, state[i].data() + col), alpha);
                 prediction = svmla_n_f32_m(columns, prediction, s, k[i]);
             }
-            const svfloat32_t decayed_prediction =
-                svmul_n_f32_x(columns, prediction, alpha);
             const svfloat32_t error = svsub_f32_x(
-                columns, svld1_f32(columns, v.data() + col), decayed_prediction);
+                columns, svld1_f32(columns, v.data() + col), prediction);
             const svfloat32_t residual = svmul_n_f32_x(columns, error, beta);
 
             svfloat32_t y = zero;
@@ -252,13 +251,12 @@ struct gdn_head<D, sme_vector_float> : gdn_head<D, sme_matrix_float> {
             const svbool_t columns = svwhilelt_b32_u64(col, D);
             svfloat32_t prediction = zero;
             for (std::size_t i = 0; i < D; ++i) {
-                const svfloat32_t s = svld1_f32(columns, state[i].data() + col);
+                const svfloat32_t s = svmul_n_f32_x(
+                    columns, svld1_f32(columns, state[i].data() + col), alpha);
                 prediction = svmla_n_f32_m(columns, prediction, s, k[i]);
             }
-            const svfloat32_t decayed_prediction =
-                svmul_n_f32_x(columns, prediction, alpha);
             const svfloat32_t error = svsub_f32_x(
-                columns, svld1_f32(columns, v.data() + col), decayed_prediction);
+                columns, svld1_f32(columns, v.data() + col), prediction);
             const svfloat32_t residual = svmul_n_f32_x(columns, error, beta);
 
             svfloat32_t y = zero;
@@ -279,8 +277,7 @@ namespace detail {
 
 __attribute__((always_inline))
 inline svfloat32_t residual_vector(svbool_t pg, svfloat32_t prediction,
-                                  const float* value, float alpha, float beta) __arm_streaming {
-    prediction = svmul_n_f32_x(pg, prediction, alpha);
+                                  const float* value, float beta) __arm_streaming {
     const svfloat32_t error = svsub_f32_x(pg, svld1_f32(pg, value), prediction);
     return svmul_n_f32_x(pg, error, beta);
 }
@@ -315,11 +312,11 @@ struct sme_full_block<D, 2> {
         for (std::size_t row = 0; row < D; ++row) {
             const svfloat32x2_t values = svld1_f32_x2(svptrue_c32(), state[row].data() + col);
             const svfloat32_t key = svdup_f32(k[row]);
-            r0 = svmla_f32_m(pg0, r0, svget2_f32(values, 0), key);
-            r1 = svmla_f32_m(pg1, r1, svget2_f32(values, 1), key);
+            r0 = svmla_f32_m(pg0, r0, svmul_n_f32_x(pg0, svget2_f32(values, 0), alpha), key);
+            r1 = svmla_f32_m(pg1, r1, svmul_n_f32_x(pg1, svget2_f32(values, 1), alpha), key);
         }
-        r0 = residual_vector(pg0, r0, v.data() + col, alpha, beta);
-        r1 = residual_vector(pg1, r1, v.data() + col + lanes, alpha, beta);
+        r0 = residual_vector(pg0, r0, v.data() + col, beta);
+        r1 = residual_vector(pg1, r1, v.data() + col + lanes, beta);
 
         svfloat32_t y0 = zero, y1 = zero;
         for (std::size_t row = 0; row < D; ++row) {
@@ -356,15 +353,15 @@ struct sme_full_block<D, 4> {
         for (std::size_t row = 0; row < D; ++row) {
             const svfloat32x4_t values = svld1_f32_x4(svptrue_c32(), state[row].data() + col);
             const svfloat32_t key = svdup_f32(k[row]);
-            r0 = svmla_f32_m(pg0, r0, svget4_f32(values, 0), key);
-            r1 = svmla_f32_m(pg1, r1, svget4_f32(values, 1), key);
-            r2 = svmla_f32_m(pg2, r2, svget4_f32(values, 2), key);
-            r3 = svmla_f32_m(pg3, r3, svget4_f32(values, 3), key);
+            r0 = svmla_f32_m(pg0, r0, svmul_n_f32_x(pg0, svget4_f32(values, 0), alpha), key);
+            r1 = svmla_f32_m(pg1, r1, svmul_n_f32_x(pg1, svget4_f32(values, 1), alpha), key);
+            r2 = svmla_f32_m(pg2, r2, svmul_n_f32_x(pg2, svget4_f32(values, 2), alpha), key);
+            r3 = svmla_f32_m(pg3, r3, svmul_n_f32_x(pg3, svget4_f32(values, 3), alpha), key);
         }
-        r0 = residual_vector(pg0, r0, v.data() + col, alpha, beta);
-        r1 = residual_vector(pg1, r1, v.data() + col + lanes, alpha, beta);
-        r2 = residual_vector(pg2, r2, v.data() + col + 2 * lanes, alpha, beta);
-        r3 = residual_vector(pg3, r3, v.data() + col + 3 * lanes, alpha, beta);
+        r0 = residual_vector(pg0, r0, v.data() + col, beta);
+        r1 = residual_vector(pg1, r1, v.data() + col + lanes, beta);
+        r2 = residual_vector(pg2, r2, v.data() + col + 2 * lanes, beta);
+        r3 = residual_vector(pg3, r3, v.data() + col + 3 * lanes, beta);
 
         svfloat32_t y0 = zero, y1 = zero, y2 = zero, y3 = zero;
         for (std::size_t row = 0; row < D; ++row) {
@@ -406,14 +403,14 @@ private:
     __attribute__((always_inline))
     static inline svfloat32x4_t predict_row(svfloat32x4_t acc, const vector_type& row,
                                             std::size_t col, std::size_t lanes,
-                                            svfloat32_t key) __arm_streaming {
+                                            svfloat32_t key, float alpha) __arm_streaming {
         const std::size_t column = col + I * lanes;
         const svbool_t pg = svwhilelt_b32_u64(column, D);
         const std::size_t offset = column < D ? column : D;
-        const svfloat32_t s = svld1_f32(pg, row.data() + offset);
+        const svfloat32_t s = svmul_n_f32_x(pg, svld1_f32(pg, row.data() + offset), alpha);
         acc = svset4_f32(acc, I, svmla_f32_m(pg, svget4_f32(acc, I), s, key));
         if constexpr (I + 1 < B)
-            return predict_row<I + 1>(acc, row, col, lanes, key);
+            return predict_row<I + 1>(acc, row, col, lanes, key, alpha);
         return acc;
     }
 
@@ -440,15 +437,15 @@ private:
     __attribute__((always_inline))
     static inline svfloat32x4_t make_residual(svfloat32x4_t acc, const vector_type& v,
                                              std::size_t col, std::size_t lanes,
-                                             float alpha, float beta) __arm_streaming {
+                                             float beta) __arm_streaming {
         const std::size_t column = col + I * lanes;
         const svbool_t pg = svwhilelt_b32_u64(column, D);
         const std::size_t offset = column < D ? column : D;
-        const svfloat32_t prediction = svmul_n_f32_x(pg, svget4_f32(acc, I), alpha);
-        const svfloat32_t error = svsub_f32_x(pg, svld1_f32(pg, v.data() + offset), prediction);
+        const svfloat32_t error = svsub_f32_x(
+            pg, svld1_f32(pg, v.data() + offset), svget4_f32(acc, I));
         acc = svset4_f32(acc, I, svmul_n_f32_x(pg, error, beta));
         if constexpr (I + 1 < B)
-            return make_residual<I + 1>(acc, v, col, lanes, alpha, beta);
+            return make_residual<I + 1>(acc, v, col, lanes, beta);
         return acc;
     }
 
@@ -497,8 +494,8 @@ public:
             const svfloat32_t zero = svdup_f32(0.0f);
             svfloat32x4_t residual = svcreate4_f32(zero, zero, zero, zero);
             for (std::size_t row = 0; row < D; ++row)
-                residual = predict_row(residual, state[row], col, lanes, svdup_f32(k[row]));
-            residual = make_residual(residual, v, col, lanes, alpha, beta);
+                residual = predict_row(residual, state[row], col, lanes, svdup_f32(k[row]), alpha);
+            residual = make_residual(residual, v, col, lanes, beta);
 
             svfloat32x4_t y = svcreate4_f32(zero, zero, zero, zero);
             for (std::size_t row = 0; row < D; ++row) {

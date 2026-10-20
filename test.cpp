@@ -18,6 +18,7 @@ template struct gated_delta::gdn_head<128, gated_delta::sme_blocked_float<4>>;
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <random>
 
 template <class Scalar>
@@ -152,8 +153,35 @@ void run_batch(const char* name) {
     }
 }
 
+// Decay must precede prediction: the undecayed sum overflows with finite state.
+template <class Backend>
+void run_decay_overflow(const char* name) {
+    constexpr std::size_t D = 257; // Full SME2 blocks and a tail at every tested SVL.
+    using head_type = gated_delta::gdn_head<D, Backend>;
+    using scalar_type = typename head_type::scalar_type;
+    head_type head;
+    typename head_type::vector_type q{}, k{}, v{}, output{};
+    for (std::size_t i = 0; i < 4; ++i)
+        q[i] = k[i] = scalar_type(0.5);
+    v.fill(1);
+    for (scalar_type alpha : {scalar_type(0), std::numeric_limits<scalar_type>::min()}) {
+        for (auto& row : head.state)
+            row.fill(std::numeric_limits<scalar_type>::max());
+        const scalar_type decayed = alpha * std::numeric_limits<scalar_type>::max();
+        const scalar_type corrected = decayed + scalar_type(0.5) * (1 - 2 * decayed);
+        head.update(q, k, v, alpha, 1, output);
+        for (std::size_t j = 0; j < D; ++j) {
+            check(output[j], 2 * corrected, D, 0, name, "overflow output");
+            for (std::size_t i = 0; i < D; ++i)
+                check(head.state[i][j], i < 4 ? corrected : decayed,
+                      D, 0, name, "overflow state");
+        }
+    }
+}
+
 template <class Backend>
 void run_dimensions(const char* name) {
+    run_decay_overflow<Backend>(name);
     run<1, Backend>(name); run<3, Backend>(name); run<16, Backend>(name);
     run<17, Backend>(name); run<32, Backend>(name); run<65, Backend>(name);
     run<128, Backend>(name);

@@ -107,7 +107,7 @@ state and the output accumulation.
 
 The kernel uses one ZA tile, two state reads, and no scratch arrays. It does not schedule prefetches
 automatically. This is a correctness baseline, not a measured performance optimization.
-Floating-point contraction and decay ordering can cause small differences between backends.
+Floating-point contraction can cause small differences between backends.
 
 Both SME backends require hardware and OS support for streaming mode. The ZA-based backend also uses
 SME FP32 outer products and private ZA storage. `sme_vector_float` inherits state and prefetch
