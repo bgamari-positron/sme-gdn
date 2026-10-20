@@ -112,6 +112,7 @@ std::size_t positive_number(const char* text) {
 
 #if defined(__ARM_FEATURE_SME)
 __arm_locally_streaming
+__attribute__((noinline))
 std::size_t streaming_bytes() {
     return svcntb();
 }
