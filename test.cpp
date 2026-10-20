@@ -237,7 +237,73 @@ void run_dimensions(const char* name) {
     std::printf("PASS: %s FP64-oracle, batch, and prefill checks\n", name);
 }
 
+template <std::size_t D, std::size_t C, class Scalar>
+void run_rowwise() {
+    using prefill_type = gated_delta::gdn_prefill<D, gated_delta::rowwise_prefill<C, Scalar>>;
+    using oracle_type = gated_delta::gdn_head<D, double>;
+    constexpr std::size_t count = 2 * C + 3;
+    std::mt19937 random(456 + D + C);
+    std::uniform_real_distribution<Scalar> sample(-1, 1);
+    for (bool reset : {false, true}) {
+        prefill_type whole, split;
+        oracle_type oracle;
+        std::array<typename prefill_type::vector_type, count> q{}, k{}, v{}, got{}, parts{};
+        std::array<typename oracle_type::vector_type, count> expected{};
+        std::array<Scalar, count> alpha{}, beta{};
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j) {
+                check(whole.state[i][j], 0, D, 0, "rowwise", "initial state");
+                oracle.state[i][j] = whole.state[i][j] = split.state[i][j] = sample(random);
+            }
+        for (std::size_t t = 0; t < count; ++t) {
+            alpha[t] = t % 3 == 0 ? Scalar(1) : Scalar(0.97);
+            if (reset && (t == C / 2 || t == C))
+                alpha[t] = 0;
+            beta[t] = t % 5 == 0 ? Scalar(0) : t % 7 == 0 ? Scalar(1) : Scalar(0.6);
+            double norm = 0;
+            for (std::size_t d = 0; d < D; ++d) {
+                q[t][d] = sample(random) / std::sqrt(Scalar(D));
+                k[t][d] = sample(random);
+                v[t][d] = sample(random);
+                norm += double(k[t][d]) * k[t][d];
+            }
+            typename oracle_type::vector_type oq{}, ok{}, ov{};
+            for (std::size_t d = 0; d < D; ++d) {
+                k[t][d] = Scalar(k[t][d] / std::sqrt(norm));
+                oq[d] = q[t][d]; ok[d] = k[t][d]; ov[d] = v[t][d];
+            }
+            oracle.update(oq, ok, ov, alpha[t], beta[t], expected[t]);
+        }
+        const auto saved = whole.state;
+        whole.update(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0);
+        if (whole.state != saved)
+            std::abort();
+        whole.update(q.data(), k.data(), v.data(), alpha.data(), beta.data(), got.data(), count);
+        // Change chunk boundaries between calls and exercise a one-token call.
+        split.update(q.data(), k.data(), v.data(), alpha.data(), beta.data(), parts.data(), 1);
+        split.update(q.data() + 1, k.data() + 1, v.data() + 1,
+                     alpha.data() + 1, beta.data() + 1, parts.data() + 1, C);
+        constexpr std::size_t tail = C + 1;
+        split.update(q.data() + tail, k.data() + tail, v.data() + tail,
+                     alpha.data() + tail, beta.data() + tail, parts.data() + tail, count - tail);
+        for (std::size_t t = 0; t < count; ++t)
+            for (std::size_t d = 0; d < D; ++d) {
+                check(got[t][d], expected[t][d], D, t, "rowwise", "output");
+                check(parts[t][d], expected[t][d], D, t, "rowwise", "split output");
+            }
+        for (std::size_t i = 0; i < D; ++i)
+            for (std::size_t j = 0; j < D; ++j) {
+                check(whole.state[i][j], oracle.state[i][j], D, count, "rowwise", "state");
+                check(split.state[i][j], oracle.state[i][j], D, count, "rowwise", "split state");
+            }
+    }
+}
+
 int main() {
+    run_rowwise<1, 1, float>(); run_rowwise<1, 1, double>();
+    run_rowwise<17, 4, float>(); run_rowwise<17, 4, double>();
+    run_rowwise<128, 64, float>(); run_rowwise<128, 64, double>();
+    std::puts("PASS: row-wise WY prefill versus FP64 recurrence");
     run_dimensions<float>("float");
     run_dimensions<double>("double");
 #if defined(__ARM_FEATURE_SME)
