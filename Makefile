@@ -7,6 +7,8 @@ SVL_BYTES ?= 16 32 64 128 256
 .PHONY: all check benchmark benchmark-smoke clean
 all: build/test build/benchmark
 
+build/test: prefill.h
+
 build/%: %.cpp gated_delta.h Makefile
 	mkdir -p build
 	$(CROSS_CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LDFLAGS) $(LDLIBS) -o "$@"

@@ -1,4 +1,4 @@
-#include "gated_delta.h"
+#include "prefill.h"
 
 #if defined(GATED_DELTA_COMPILE_ONLY)
 #if !defined(__ARM_FEATURE_SME)
@@ -179,6 +179,51 @@ void run_decay_overflow(const char* name) {
     }
 }
 
+template <std::size_t D, class Backend>
+void run_prefill(const char* name) {
+    using head_type = gated_delta::gdn_head<D, Backend>;
+    using prefill_type = gated_delta::gdn_prefill<D, gated_delta::reference_prefill<Backend>>;
+    using scalar_type = typename head_type::scalar_type;
+    constexpr std::size_t count = 5;
+    prefill_type whole, split;
+    head_type individual;
+    std::array<typename head_type::vector_type, count> q{}, k{}, v{}, got{}, parts{}, expected{};
+    std::array<scalar_type, count> alpha{1, scalar_type(0.9), 0, 1, scalar_type(0.7)};
+    std::array<scalar_type, count> beta{scalar_type(0.6), 0, 1, scalar_type(0.3), 1};
+    for (std::size_t i = 0; i < D; ++i)
+        for (std::size_t j = 0; j < D; ++j) {
+            check(whole.state[i][j], 0, D, 0, name, "prefill initial state");
+            whole.state[i][j] = split.state[i][j] = individual.state[i][j] =
+                scalar_type(i + j + 1) / scalar_type(D * D);
+        }
+    for (std::size_t t = 0; t < count; ++t) {
+        for (std::size_t j = 0; j < D; ++j) {
+            q[t][j] = scalar_type(t + j + 1) / scalar_type(D * D);
+            k[t][j] = scalar_type(j % 3 + 1) / scalar_type(D);
+            v[t][j] = scalar_type(t + 1) - scalar_type(j) / scalar_type(D);
+        }
+        individual.update(q[t], k[t], v[t], alpha[t], beta[t], expected[t]);
+    }
+    whole.update(q.data(), k.data(), v.data(), alpha.data(), beta.data(), got.data(), count);
+    split.update(q.data(), k.data(), v.data(), alpha.data(), beta.data(), parts.data(), 2);
+    const auto saved = split.state;
+    split.update(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0);
+    if (split.state != saved)
+        std::abort();
+    split.update(q.data() + 2, k.data() + 2, v.data() + 2,
+                 alpha.data() + 2, beta.data() + 2, parts.data() + 2, count - 2);
+    for (std::size_t t = 0; t < count; ++t)
+        for (std::size_t j = 0; j < D; ++j) {
+            check(got[t][j], expected[t][j], D, t, name, "prefill output");
+            check(parts[t][j], expected[t][j], D, t, name, "split prefill output");
+        }
+    for (std::size_t i = 0; i < D; ++i)
+        for (std::size_t j = 0; j < D; ++j) {
+            check(whole.state[i][j], individual.state[i][j], D, count, name, "prefill state");
+            check(split.state[i][j], individual.state[i][j], D, count, name, "split prefill state");
+        }
+}
+
 template <class Backend>
 void run_dimensions(const char* name) {
     run_decay_overflow<Backend>(name);
@@ -187,7 +232,9 @@ void run_dimensions(const char* name) {
     run<128, Backend>(name);
     run_batch<17, Backend>(name);
     run_batch<128, Backend>(name);
-    std::printf("PASS: %s FP64-oracle checks and batched-versus-individual updates\n", name);
+    run_prefill<17, Backend>(name);
+    run_prefill<128, Backend>(name);
+    std::printf("PASS: %s FP64-oracle, batch, and prefill checks\n", name);
 }
 
 int main() {
