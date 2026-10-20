@@ -238,14 +238,12 @@ The flake pins Nixpkgs and provides an AArch64 cross-compiler, Make, and QEMU us
 It supports x86-64 and AArch64 Linux hosts. From the repository root:
 
 ```sh
-nix develop "path:$PWD/examples/gated_delta" \
-  --command make -C examples/gated_delta check
+nix develop "path:$PWD" --command make check
 ```
 
 For an interactive shell:
 
 ```sh
-cd examples/gated_delta
 nix develop "path:$PWD"
 make check
 ```
@@ -262,11 +260,10 @@ QEMU validates instruction behavior, not CME performance or prefetch timing.
 output. Build the static AArch64 executable from the repository root:
 
 ```sh
-nix develop "path:$PWD/examples/gated_delta" \
-  --command make -C examples/gated_delta benchmark
+nix develop "path:$PWD" --command make benchmark
 ```
 
-Copy `examples/gated_delta/build/benchmark` to an SME2-capable AArch64 system for the default build.
+Copy `build/benchmark` to an SME2-capable AArch64 system for the default build.
 On that system, run:
 
 ```sh
@@ -291,8 +288,7 @@ establish correctness.
 For a short QEMU execution check:
 
 ```sh
-nix develop "path:$PWD/examples/gated_delta" \
-  --command make -C examples/gated_delta benchmark-smoke
+nix develop "path:$PWD" --command make benchmark-smoke
 ```
 
 This runs 32 updates per trial and three trials at a 64-byte streaming vector length. **Do not use
@@ -301,7 +297,7 @@ host-only build can compare the scalar backends:
 
 ```sh
 g++ -std=c++17 -O3 -Wall -Wextra -Werror \
-  examples/gated_delta/benchmark.cpp -o /tmp/gdn-benchmark
+  benchmark.cpp -o /tmp/gdn-benchmark
 /tmp/gdn-benchmark 10000 5
 ```
 
@@ -311,7 +307,7 @@ On a host with a C++17 compiler:
 
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -Werror \
-  examples/gated_delta/test.cpp -o /tmp/gated-delta-test
+  test.cpp -o /tmp/gated-delta-test
 /tmp/gated-delta-test
 ```
 
