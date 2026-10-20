@@ -272,7 +272,7 @@ Scratch storage is on the stack: `4*C*D + 2*C*C + C` floats for chunk size `C`.
 For `D=128, C=64`, this is 160.25 KiB, excluding the object state and compiler spills.
 Packing is scalar and the two chunk matrices use dense storage.
 This is a correctness baseline; hardware measurements must establish performance.
-The existing benchmark measures generation calls, not this prefill backend.
+`prefill_benchmark.cpp` compares these prefill strategies; `benchmark.cpp` measures generation.
 
 ## Build and validate with Nix
 
@@ -342,6 +342,41 @@ g++ -std=c++17 -O3 -Wall -Wextra -Werror \
   benchmark.cpp -o /tmp/gdn-benchmark
 /tmp/gdn-benchmark 10000 5
 ```
+
+## Prefill benchmark
+
+`prefill_benchmark.cpp` times one whole prompt per trial at D=128 and chunk size 64.
+It compares FP32/FP64 sequential references, portable FP32 row-wise WY, an SME vector
+generation reference, SME row-wise WY, and SME blocked WY with block sizes 8, 16, and 32.
+It reports median/minimum ns per token, tokens per second from the median, and a checksum.
+
+```sh
+nix develop "path:$PWD" --command make prefill-benchmark
+```
+
+Copy `build/prefill_benchmark` to an SME2-capable system for the default build, then run:
+
+```sh
+./prefill_benchmark 4096 5
+```
+
+Arguments are tokens per prompt and trials; both must be positive.
+Each backend receives the same deterministic FP32 inputs and scalar gates.
+Keys have unit norm, queries are scaled by `1/sqrt(128)`, alpha is 0.99, and beta is 0.6.
+Before each trial, at most 64 tokens warm up the kernel. State is then reset to zero.
+Allocation, input generation, warmup, state reset, and checksum calculation are not timed.
+The timed call includes packing, WY formation, all outputs, final state, and mode transitions.
+No explicit prefetch is issued. The checksum includes every output and final-state element.
+A finite checksum is not a correctness check; run `make check` separately.
+
+For a QEMU smoke test with one full chunk and a tail:
+
+```sh
+nix develop "path:$PWD" --command make prefill-benchmark-smoke
+```
+
+This uses 65 tokens and three trials. QEMU timings do not establish hardware speedups.
+For scalar-only timing, compile `prefill_benchmark.cpp` with the host C++17 compiler.
 
 ## Scalar-only check
 

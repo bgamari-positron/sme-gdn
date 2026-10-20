@@ -4,10 +4,10 @@ CXXFLAGS ?= -O3 -g -std=c++17 -march=armv9-a+sme2 -Wall -Wextra -Werror
 LDFLAGS ?= -static
 SVL_BYTES ?= 16 32 64 128 256
 
-.PHONY: all check benchmark benchmark-smoke clean
-all: build/test build/benchmark
+.PHONY: all check benchmark benchmark-smoke prefill-benchmark prefill-benchmark-smoke clean
+all: build/test build/benchmark build/prefill_benchmark
 
-build/test: prefill.h
+build/test build/prefill_benchmark: prefill.h
 
 build/%: %.cpp gated_delta.h Makefile
 	mkdir -p build
@@ -24,6 +24,12 @@ benchmark: build/benchmark
 benchmark-smoke: build/benchmark
 	@echo "QEMU smoke test only: these timings do not represent C1 performance."
 	$(QEMU) -cpu max,sme-default-vector-length=64 ./build/benchmark 32 3
+
+prefill-benchmark: build/prefill_benchmark
+
+prefill-benchmark-smoke: build/prefill_benchmark
+	@echo "QEMU smoke test only: these timings do not represent C1 performance."
+	$(QEMU) -cpu max,sme-default-vector-length=64 ./build/prefill_benchmark 65 3
 
 clean:
 	rm -rf build
