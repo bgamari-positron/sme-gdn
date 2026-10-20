@@ -314,6 +314,14 @@ int main() {
     run_rowwise<65, 33, float, gated_delta::sme_rowwise_prefill<33>>();
     run_rowwise<128, 64, float, gated_delta::sme_rowwise_prefill<64>>();
     std::puts("PASS: SME row-wise WY prefill versus FP64 recurrence");
+    run_rowwise<1, 1, float, gated_delta::sme_blocked_prefill<1, 1>>();
+    run_rowwise<17, 17, float, gated_delta::sme_blocked_prefill<17, 1>>();
+    run_rowwise<17, 17, float, gated_delta::sme_blocked_prefill<17, 4>>();
+    run_rowwise<17, 4, float, gated_delta::sme_blocked_prefill<4, 16>>();
+    run_rowwise<65, 33, float, gated_delta::sme_blocked_prefill<33, 17>>();
+    run_rowwise<128, 64, float, gated_delta::sme_blocked_prefill<64, 16>>();
+    run_rowwise<128, 64, float, gated_delta::sme_blocked_prefill<64, 64>>();
+    std::puts("PASS: SME blocked WY prefill versus FP64 recurrence");
     run_dimensions<gated_delta::sme_matrix_float>("sme_matrix_float");
     run_dimensions<gated_delta::sme_vector_float>("sme_vector_float");
     run_dimensions<gated_delta::sme_blocked_float<1>>("sme_blocked_float<1>");

@@ -240,6 +240,7 @@ The object retains its final state between calls. Select one of these backends:
 - `reference_prefill<GenerationBackend>` calls an existing generation backend per token.
 - `rowwise_prefill<ChunkSize, Scalar>` performs portable row-wise WY formation.
 - `sme_rowwise_prefill<ChunkSize>` performs FP32 WY formation with SME.
+- `sme_blocked_prefill<ChunkSize, BlockSize>` uses SME blocked forward substitution.
 
 ```cpp
 #include "prefill.h"
@@ -256,11 +257,16 @@ A zero token count permits null pointers and leaves state unchanged.
 Chunked backends handle partial final chunks and zero decay gates without division.
 Floating-point evaluation order differs from sequential generation.
 
-The SME backend uses one streaming region and private ZA context per call.
+Both SME backends use one streaming region and private ZA context per call.
 ZA0.S accumulates tiled Gram, attention, state-read, and state-update products.
-Streaming vectors perform row-wise forward substitution.
-The backend requires SME FP32 outer products, but not SME2.
-Selecting it without an SME compilation target fails to compile.
+The row-wise backend uses streaming vectors for the entire triangular solve.
+The blocked backend uses ZA products to subtract contributions from earlier blocks,
+then streaming vectors to solve each unit-lower-triangular diagonal block.
+`BlockSize` counts tokens, independently of the streaming vector length.
+It defaults to 16; partial blocks and blocks larger than a chunk are supported.
+For example, select `sme_blocked_prefill<64, 16>` for four blocks per full chunk.
+Both backends require SME FP32 outer products, but not SME2.
+Selecting either without an SME compilation target fails to compile.
 
 Scratch storage is on the stack: `4*C*D + 2*C*C + C` floats for chunk size `C`.
 For `D=128, C=64`, this is 160.25 KiB, excluding the object state and compiler spills.
