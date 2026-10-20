@@ -232,6 +232,42 @@ without FEAT_RPRFM treats the instruction as a NOP. Benchmark the lead time on h
 prefetches can evict useful data or exceed prefetch resources. Do not issue another prefetch for an
 overlapping range before consuming the first.
 
+## Prefill
+
+`prefill.h` provides `gdn_prefill<D, Backend>` for consecutive tokens of one head.
+The object retains its final state between calls. Select one of these backends:
+
+- `reference_prefill<GenerationBackend>` calls an existing generation backend per token.
+- `rowwise_prefill<ChunkSize, Scalar>` performs portable row-wise WY formation.
+- `sme_rowwise_prefill<ChunkSize>` performs FP32 WY formation with SME.
+
+```cpp
+#include "prefill.h"
+using Prefill = gated_delta::gdn_prefill<128, gated_delta::sme_rowwise_prefill<64>>;
+Prefill head;
+// q, k, v, and output point to token_count vector_type elements.
+// alpha and beta point to token_count scalar_type elements.
+head.update(q, k, v, alpha, beta, output, token_count);
+```
+
+The arrays use token order, not head order. Each output includes its token's update.
+The same finite-input and non-overlap requirements apply as for generation.
+A zero token count permits null pointers and leaves state unchanged.
+Chunked backends handle partial final chunks and zero decay gates without division.
+Floating-point evaluation order differs from sequential generation.
+
+The SME backend uses one streaming region and private ZA context per call.
+ZA0.S accumulates tiled Gram, attention, state-read, and state-update products.
+Streaming vectors perform row-wise forward substitution.
+The backend requires SME FP32 outer products, but not SME2.
+Selecting it without an SME compilation target fails to compile.
+
+Scratch storage is on the stack: `4*C*D + 2*C*C + C` floats for chunk size `C`.
+For `D=128, C=64`, this is 160.25 KiB, excluding the object state and compiler spills.
+Packing is scalar and the two chunk matrices use dense storage.
+This is a correctness baseline; hardware measurements must establish performance.
+The existing benchmark measures generation calls, not this prefill backend.
+
 ## Build and validate with Nix
 
 The flake pins Nixpkgs and provides an AArch64 cross-compiler, Make, and QEMU user-mode emulation.

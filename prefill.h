@@ -14,6 +14,12 @@ struct rowwise_prefill {
     static_assert(ChunkSize > 0, "A chunk must contain at least one token");
 };
 
+// Selects FP32 row-wise WY with streaming vectors and ZA matrix products.
+template <std::size_t ChunkSize = 64>
+struct sme_rowwise_prefill {
+    static_assert(ChunkSize > 0, "A chunk must contain at least one token");
+};
+
 // Stores one head's state between prefill calls. Backend selects the strategy.
 // Specializations expose scalar_type, vector_type, state_type, state, and update().
 template <std::size_t D, class Backend = reference_prefill<>>
@@ -132,5 +138,148 @@ struct gdn_prefill<D, rowwise_prefill<C, Scalar>> : gdn_head<D, Scalar> {
         }
     }
 };
+
+#if defined(__ARM_FEATURE_SME)
+template <std::size_t D, std::size_t C>
+struct gdn_prefill<D, sme_rowwise_prefill<C>> : gdn_head<D, sme_matrix_float> {
+    static_assert(C > 0, "A chunk must contain at least one token");
+    using base_type = gdn_head<D, sme_matrix_float>;
+    using typename base_type::vector_type;
+    using base_type::state;
+    using base_type::update;
+
+private:
+    // dst = (accumulate ? dst : 0) + scale * transpose(left) * right.
+    // Only the active rectangle is read or written. ZA0.S is scratch.
+    template <std::size_t M, std::size_t K, std::size_t N>
+    __attribute__((always_inline))
+    static inline void product(const std::array<std::array<float, M>, K>& left,
+                               const std::array<std::array<float, N>, K>& right,
+                               std::array<float, N>* dst, std::size_t rows,
+                               std::size_t columns, std::size_t inner,
+                               float scale, bool accumulate) __arm_streaming __arm_inout("za") {
+        const std::size_t lanes = svcntw();
+        const svfloat32_t zero = svdup_f32(0);
+        for (std::size_t row = 0; row < rows; row += lanes) {
+            const svbool_t rp = svwhilelt_b32_u64(row, rows);
+            const std::size_t height = rows - row < lanes ? rows - row : lanes;
+            for (std::size_t col = 0; col < columns; col += lanes) {
+                const svbool_t cp = svwhilelt_b32_u64(col, columns);
+                for (std::size_t i = 0; i < height; ++i) {
+                    const svfloat32_t initial = accumulate ?
+                        svld1_f32(cp, dst[row + i].data() + col) : zero;
+                    svwrite_hor_za32_f32_m(0, static_cast<uint32_t>(i), cp, initial);
+                }
+                for (std::size_t a = 0; a < inner; ++a) {
+                    const svfloat32_t l = svmul_n_f32_x(
+                        rp, svld1_f32(rp, left[a].data() + row), scale);
+                    svmopa_za32_f32_m(0, rp, cp, l,
+                                     svld1_f32(cp, right[a].data() + col));
+                }
+                for (std::size_t i = 0; i < height; ++i)
+                    svst1_f32(cp, dst[row + i].data() + col,
+                              svread_hor_za32_f32_m(zero, cp, 0, static_cast<uint32_t>(i)));
+            }
+        }
+    }
+
+public:
+    // Same token-array contract as reference_prefill. One streaming/ZA region
+    // covers all chunks. Requires SME FP32 outer products and OS ZA support.
+    __arm_locally_streaming __arm_new("za")
+    __attribute__((noinline))
+    void update(const vector_type* q, const vector_type* k, const vector_type* v,
+                const float* alpha, const float* beta,
+                vector_type* output, std::size_t count) {
+        if (count == 0)
+            return;
+        // ponytail: dense stack scratch and scalar packing; tune on hardware.
+        // Scratch holds 4*C*D + 2*C*C + C floats, independent of token count.
+        std::array<vector_type, C> u, w;
+        std::array<std::array<float, C>, D> kt, xt;
+        std::array<std::array<float, C>, C> gram, attention;
+        std::array<float, C> gamma;
+        const std::size_t lanes = svcntw();
+        for (std::size_t start = 0; start < count;) {
+            const std::size_t n = count - start < C ? count - start : C;
+            float prefix = 1;
+            for (std::size_t i = 0; i < n; ++i) {
+                gamma[i] = prefix *= alpha[start + i];
+                for (std::size_t d = 0; d < D; ++d) {
+                    kt[d][i] = k[start + i][d];
+                    xt[d][i] = q[start + i][d];
+                }
+            }
+            product(kt, kt, gram.data(), n, n, D, 1, false);
+            product(xt, kt, attention.data(), n, n, D, 1, false);
+
+            // Forward substitution in the same gated system as rowwise_prefill.
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::size_t t = start + i;
+                for (std::size_t d = 0; d < D; d += lanes) {
+                    const svbool_t pg = svwhilelt_b32_u64(d, D);
+                    svfloat32_t ui = svmul_n_f32_x(pg, svld1_f32(pg, v[t].data() + d), beta[t]);
+                    svfloat32_t wi = svmul_n_f32_x(
+                        pg, svld1_f32(pg, k[t].data() + d), beta[t] * gamma[i]);
+                    float decay = 1;
+                    for (std::size_t j = i; j > 0;) {
+                        decay *= alpha[start + j];
+                        --j;
+                        const float a = beta[t] * decay * gram[i][j];
+                        ui = svmla_n_f32_m(pg, ui, svld1_f32(pg, u[j].data() + d), -a);
+                        wi = svmla_n_f32_m(pg, wi, svld1_f32(pg, w[j].data() + d), -a);
+                    }
+                    svst1_f32(pg, u[i].data() + d, ui);
+                    svst1_f32(pg, w[i].data() + d, wi);
+                }
+            }
+
+            // Read incoming state for output before reusing X for transpose(W).
+            for (std::size_t d = 0; d < D; ++d)
+                for (std::size_t i = 0; i < n; ++i)
+                    xt[d][i] *= gamma[i];
+            product(xt, state, output + start, n, D, D, 1, false);
+            for (std::size_t d = 0; d < D; ++d)
+                for (std::size_t i = 0; i < n; ++i)
+                    xt[d][i] = w[i][d];
+            product(xt, state, u.data(), n, D, D, -1, true);
+
+            // Reuse Gram storage for transpose(masked, decayed attention).
+            // Direct interval products also support alpha=0 inside a chunk.
+            for (std::size_t i = 0; i < n; ++i) {
+                for (std::size_t j = i + 1; j < n; ++j)
+                    gram[j][i] = 0;
+                float decay = 1;
+                for (std::size_t j = i + 1; j > 0;) {
+                    --j;
+                    gram[j][i] = decay * attention[i][j];
+                    decay *= alpha[start + j];
+                }
+            }
+            product(gram, u, output + start, n, D, n, 1, true);
+
+            // No output or residual still needs the incoming state.
+            for (std::size_t a = 0; a < D; ++a)
+                for (std::size_t d = 0; d < D; d += lanes) {
+                    const svbool_t pg = svwhilelt_b32_u64(d, D);
+                    svst1_f32(pg, state[a].data() + d, svmul_n_f32_x(
+                        pg, svld1_f32(pg, state[a].data() + d), gamma[n - 1]));
+                }
+            float decay = 1;
+            for (std::size_t j = n; j > 0;) {
+                --j;
+                for (std::size_t d = 0; d < D; d += lanes) {
+                    const svbool_t pg = svwhilelt_b32_u64(d, D);
+                    svst1_f32(pg, w[j].data() + d, svmul_n_f32_x(
+                        pg, svld1_f32(pg, k[start + j].data() + d), decay));
+                }
+                decay *= alpha[start + j];
+            }
+            product(w, u, state.data(), D, D, n, 1, true);
+            start += n;
+        }
+    }
+};
+#endif
 
 } // namespace gated_delta

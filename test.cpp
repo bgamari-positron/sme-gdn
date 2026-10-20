@@ -237,9 +237,10 @@ void run_dimensions(const char* name) {
     std::printf("PASS: %s FP64-oracle, batch, and prefill checks\n", name);
 }
 
-template <std::size_t D, std::size_t C, class Scalar>
+template <std::size_t D, std::size_t C, class Scalar,
+          class Backend = gated_delta::rowwise_prefill<C, Scalar>>
 void run_rowwise() {
-    using prefill_type = gated_delta::gdn_prefill<D, gated_delta::rowwise_prefill<C, Scalar>>;
+    using prefill_type = gated_delta::gdn_prefill<D, Backend>;
     using oracle_type = gated_delta::gdn_head<D, double>;
     constexpr std::size_t count = 2 * C + 3;
     std::mt19937 random(456 + D + C);
@@ -307,6 +308,12 @@ int main() {
     run_dimensions<float>("float");
     run_dimensions<double>("double");
 #if defined(__ARM_FEATURE_SME)
+    run_rowwise<1, 1, float, gated_delta::sme_rowwise_prefill<1>>();
+    run_rowwise<17, 4, float, gated_delta::sme_rowwise_prefill<4>>();
+    run_rowwise<17, 17, float, gated_delta::sme_rowwise_prefill<17>>();
+    run_rowwise<65, 33, float, gated_delta::sme_rowwise_prefill<33>>();
+    run_rowwise<128, 64, float, gated_delta::sme_rowwise_prefill<64>>();
+    std::puts("PASS: SME row-wise WY prefill versus FP64 recurrence");
     run_dimensions<gated_delta::sme_matrix_float>("sme_matrix_float");
     run_dimensions<gated_delta::sme_vector_float>("sme_vector_float");
     run_dimensions<gated_delta::sme_blocked_float<1>>("sme_blocked_float<1>");
