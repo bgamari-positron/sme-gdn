@@ -281,6 +281,58 @@ Packing is scalar and the two chunk matrices use dense storage.
 This is a correctness baseline; hardware measurements must establish performance.
 `prefill_benchmark.cpp` compares these prefill strategies; `benchmark.cpp` measures generation.
 
+## FP16 backends
+
+Include `fp16.h` to use FP16 storage and arithmetic. Existing FP32 backends are unchanged.
+`gated_delta::float16` is `__fp16` on AArch64 and `_Float16` for host reference checks.
+The compiler must support these half-precision types.
+
+| Operation | FP16 backend |
+| --- | --- |
+| Scalar decode reference | `float16` |
+| Matrix decode | `sme_matrix_half` |
+| Streaming-vector decode | `sme_vector_half` |
+| Blocked streaming-vector decode | `sme_blocked_half<B>` (B=1–4) |
+| Sequential prefill | `reference_prefill<DecodeBackend>` |
+| Portable row-wise prefill | `rowwise_prefill<C, float16>` |
+| SME row-wise prefill | `sme_rowwise_half_prefill<C>` |
+| SME blocked prefill | `sme_blocked_half_prefill<C, B>` |
+| SME joint U/W prefill | `sme_blocked_joint_half_prefill<C, B>` |
+
+```cpp
+#include "fp16.h"
+using Decode = gated_delta::gdn_head<128, gated_delta::sme_blocked_half<4>>;
+using Prefill = gated_delta::gdn_prefill<
+    128, gated_delta::sme_blocked_joint_half_prefill<64, 16>>;
+```
+
+Vectors, gates, recurrent state, outputs, and prefill scratch use FP16.
+Streaming-vector multiply, add, subtract, and FMA operations round to FP16.
+Matrix products use FP16 operands and FP32 ZA accumulation, then round to FP16 on stores.
+The WY triangular solves use FP16 FMAs; these are not FP32 solves with FP16 inputs.
+The scalar reference explicitly rounds operations and uses wide arithmetic to emulate FP16 FMA.
+
+Decode supports individual calls, `update_batch`, and streaming entry points.
+B=2/4 vector blocks use SME2 grouped halfword loads/stores when a full block fits.
+SME1 builds and incomplete blocks use predicated single-vector accesses.
+At SVL=512 bits, vector decode handles 32 halves per vector.
+Prefill packs two reduction entries per widening FMOPA and zero-pads odd reductions.
+Matrix decode pads rank-one updates with zeros, so it does not exploit two useful reduction terms.
+
+FP16 prefill scratch uses `4*C*D + 2*C*C + C` half elements.
+For D=128 and C=64, this is 80.125 KiB, excluding object state and compiler spills.
+The FP16 matrix-product helper uses full FMOPA predicates and zero-padded operands.
+This avoids an observed GCC 15.3 predicate-folding failure that dropped odd halfword contributions.
+
+FP16 changes numerical behavior. Gates near one can round to one; long decay products
+can underflow, and finite inputs can overflow intermediate values.
+Neither these tests nor finite benchmark checksums establish model-level accuracy.
+The FP16 tests compare against FP64 recurrence on the same quantized inputs.
+They allow absolute error 0.004 plus relative error 0.03 on normalized-key sequences,
+and cover resets, tails, odd reductions, split calls, and grouped loads.
+`make check` runs both FP32 and FP16 suites at all configured streaming lengths.
+Both benchmarks include FP16 rows; their inputs and gates are rounded to half before timing.
+
 ## Build and validate with Nix
 
 The flake pins Nixpkgs and provides an AArch64 cross-compiler, Make, and QEMU user-mode emulation.
@@ -325,8 +377,8 @@ updates to make each trial long compared with timer resolution and scheduling no
 clocks and competing work when comparing hardware results.
 
 Each trial starts with zero state and performs 64 untimed warmup updates. The timed loop updates one
-persistent head using 16 repeating, deterministic query/key/value inputs. All backends receive the
-same numeric inputs, including float-to-double conversion for the double backend. State and input
+persistent head using 16 repeating, deterministic query/key/value inputs. All backends convert the
+same FP32 source inputs to their storage type; FP16 inputs and gates are rounded to half. State and input
 storage are aligned to 64 bytes. Allocation, initialization, warmup, and checksum computation are
 outside the timed interval. Compiler barriers and the checksum prevent the state updates from being
 discarded. Explicit prefetch is disabled, and the SME measurements include per-call streaming-mode
@@ -368,7 +420,7 @@ Copy `build/prefill_benchmark` to an SME2-capable system for the default build, 
 ```
 
 Arguments are tokens per prompt and trials; both must be positive.
-Each backend receives the same deterministic FP32 inputs and scalar gates.
+Each backend converts the same deterministic FP32 source inputs and gates to its storage type.
 Keys have unit norm, queries are scaled by `1/sqrt(128)`, alpha is 0.99, and beta is 0.6.
 Before each trial, at most 64 tokens warm up the kernel. State is then reset to zero.
 Allocation, input generation, warmup, state reset, and checksum calculation are not timed.

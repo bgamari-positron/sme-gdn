@@ -5,18 +5,20 @@ LDFLAGS ?= -static
 SVL_BYTES ?= 16 32 64 128 256
 
 .PHONY: all check benchmark benchmark-smoke prefill-benchmark prefill-benchmark-smoke clean
-all: build/test build/benchmark build/prefill_benchmark
+all: build/test build/test_fp16 build/benchmark build/prefill_benchmark
 
-build/test build/prefill_benchmark: prefill.h
+build/test: prefill.h
+build/test_fp16 build/benchmark build/prefill_benchmark: prefill.h fp16.h
 
 build/%: %.cpp gated_delta.h Makefile
 	mkdir -p build
 	$(CROSS_CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LDFLAGS) $(LDLIBS) -o "$@"
 
-check: build/test
+check: build/test build/test_fp16
 	@set -eu; for bytes in $(SVL_BYTES); do \
 		echo "SME streaming vector length: $$bytes bytes"; \
 		$(QEMU) -cpu max,sme-default-vector-length=$$bytes ./build/test; \
+		$(QEMU) -cpu max,sme-default-vector-length=$$bytes ./build/test_fp16; \
 	done
 
 benchmark: build/benchmark

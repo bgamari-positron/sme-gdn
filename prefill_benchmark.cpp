@@ -1,4 +1,4 @@
-#include "prefill.h"
+#include "fp16.h"
 
 #include <algorithm>
 #include <charconv>
@@ -51,7 +51,7 @@ void benchmark(const char* name, const inputs& source, std::size_t trials) {
     const std::size_t count = source.q.size();
     std::vector<typename head_type::vector_type> q(count), k(count), v(count), output(count);
     std::vector<scalar_type> alpha(count, scalar_type(0.99f)), beta(count, scalar_type(0.6f));
-    // Every backend receives the same FP32 inputs, including the FP64 reference.
+    // Convert shared FP32 source inputs to each backend's storage type.
     for (std::size_t t = 0; t < count; ++t)
         for (std::size_t d = 0; d < dimension; ++d) {
             q[t][d] = source.q[t][d];
@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
     std::printf("D=%zu, chunk=%zu, %zu tokens/prompt, %zu trials, %zu warmup tokens/trial\n",
                 dimension, chunk_size, count, trials, std::min(count, chunk_size));
     std::puts("One whole-prompt call per trial, starting from zero state; all token outputs retained.");
+    std::puts("FP16 variants round inputs/gates to half and retain FP16 state; checksums need not match FP32.");
     std::puts("Allocation, input generation, warmup, state reset, and checksum are outside timing.");
     std::puts("Includes packing, WY formation, state updates, and streaming transitions; no explicit prefetch.");
     std::puts("Emulated timings are NOT C1 performance estimates. Run make check for correctness.");
@@ -140,6 +141,8 @@ int main(int argc, char** argv) {
     benchmark<reference_prefill<float>>("reference_float", source, trials);
     benchmark<reference_prefill<double>>("reference_double", source, trials);
     benchmark<rowwise_prefill<chunk_size, float>>("rowwise_float", source, trials);
+    benchmark<reference_prefill<float16>>("reference_half", source, trials);
+    benchmark<rowwise_prefill<chunk_size, float16>>("rowwise_half", source, trials);
 #if defined(__ARM_FEATURE_SME)
     benchmark<reference_prefill<sme_blocked_float<4>>>("reference_sme_vector_B4", source, trials);
     benchmark<sme_rowwise_prefill<chunk_size>>("sme_rowwise", source, trials);
@@ -149,5 +152,15 @@ int main(int argc, char** argv) {
     benchmark<sme_blocked_joint_prefill<chunk_size, 8>>("sme_joint_B8", source, trials);
     benchmark<sme_blocked_joint_prefill<chunk_size, 16>>("sme_joint_B16", source, trials);
     benchmark<sme_blocked_joint_prefill<chunk_size, 32>>("sme_joint_B32", source, trials);
+    benchmark<reference_prefill<sme_matrix_half>>("reference_sme_matrix_half", source, trials);
+    benchmark<reference_prefill<sme_vector_half>>("reference_sme_vector_half", source, trials);
+    benchmark<reference_prefill<sme_blocked_half<4>>>("reference_sme_half_B4", source, trials);
+    benchmark<sme_rowwise_half_prefill<chunk_size>>("sme_rowwise_half", source, trials);
+    benchmark<sme_blocked_half_prefill<chunk_size, 8>>("sme_blocked_half_B8", source, trials);
+    benchmark<sme_blocked_half_prefill<chunk_size, 16>>("sme_blocked_half_B16", source, trials);
+    benchmark<sme_blocked_half_prefill<chunk_size, 32>>("sme_blocked_half_B32", source, trials);
+    benchmark<sme_blocked_joint_half_prefill<chunk_size, 8>>("sme_joint_half_B8", source, trials);
+    benchmark<sme_blocked_joint_half_prefill<chunk_size, 16>>("sme_joint_half_B16", source, trials);
+    benchmark<sme_blocked_joint_half_prefill<chunk_size, 32>>("sme_joint_half_B32", source, trials);
 #endif
 }

@@ -1,4 +1,4 @@
-#include "gated_delta.h"
+#include "fp16.h"
 
 #include <algorithm>
 #include <array>
@@ -50,7 +50,7 @@ void benchmark(const char* name, const std::array<token<float>, input_count>& so
     using head_type = gated_delta::gdn_head<dimension, Backend>;
     using scalar_type = typename head_type::scalar_type;
     using clock = std::chrono::steady_clock;
-    // Convert the same FP32 input values for every backend, including double.
+    // Convert shared FP32 source inputs to each backend's storage type.
     alignas(64) std::array<token<scalar_type>, input_count> inputs{};
     for (std::size_t t = 0; t < input_count; ++t)
         for (std::size_t i = 0; i < dimension; ++i) {
@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     std::printf("D=128, %zu updates/trial, %zu trials, %zu warmup updates/trial\n",
                 updates, trials, warmup_updates);
     std::puts("One persistent head per trial; 16 repeating inputs; explicit prefetch disabled.");
+    std::puts("FP16 variants round inputs/gates to half and retain FP16 state; checksums need not match FP32.");
     std::puts("Includes per-call streaming transitions. Emulated timings are NOT C1 performance estimates.");
 #if defined(__ARM_FEATURE_SME)
     std::printf("Streaming vector length: %zu bytes\n", streaming_bytes());
@@ -144,6 +145,7 @@ int main(int argc, char** argv) {
     std::printf("%-23s %14s %14s %18s\n", "kernel", "median ns/op", "min ns/op", "checksum");
     benchmark<float>("float", inputs, updates, trials);
     benchmark<double>("double", inputs, updates, trials);
+    benchmark<gated_delta::float16>("scalar_half", inputs, updates, trials);
 #if defined(__ARM_FEATURE_SME)
     benchmark<gated_delta::sme_matrix_float>("sme_matrix_float", inputs, updates, trials);
     benchmark<gated_delta::sme_vector_float>("sme_vector_float", inputs, updates, trials);
@@ -151,5 +153,11 @@ int main(int argc, char** argv) {
     benchmark<gated_delta::sme_blocked_float<2>>("sme_blocked_float<2>", inputs, updates, trials);
     benchmark<gated_delta::sme_blocked_float<3>>("sme_blocked_float<3>", inputs, updates, trials);
     benchmark<gated_delta::sme_blocked_float<4>>("sme_blocked_float<4>", inputs, updates, trials);
+    benchmark<gated_delta::sme_matrix_half>("sme_matrix_half", inputs, updates, trials);
+    benchmark<gated_delta::sme_vector_half>("sme_vector_half", inputs, updates, trials);
+    benchmark<gated_delta::sme_blocked_half<1>>("sme_blocked_half<1>", inputs, updates, trials);
+    benchmark<gated_delta::sme_blocked_half<2>>("sme_blocked_half<2>", inputs, updates, trials);
+    benchmark<gated_delta::sme_blocked_half<3>>("sme_blocked_half<3>", inputs, updates, trials);
+    benchmark<gated_delta::sme_blocked_half<4>>("sme_blocked_half<4>", inputs, updates, trials);
 #endif
 }
