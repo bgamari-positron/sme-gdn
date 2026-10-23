@@ -26,6 +26,12 @@ struct sme_blocked_prefill {
     static_assert(ChunkSize > 0 && BlockSize > 0, "Chunk and block sizes must be positive");
 };
 
+// Selects blocked substitution with joint U/W updates in two ZA tiles.
+template <std::size_t ChunkSize = 64, std::size_t BlockSize = 16>
+struct sme_blocked_joint_prefill {
+    static_assert(ChunkSize > 0 && BlockSize > 0, "Chunk and block sizes must be positive");
+};
+
 // Stores one head's state between prefill calls. Backend selects the strategy.
 // Specializations expose scalar_type, vector_type, state_type, state, and update().
 template <std::size_t D, class Backend = reference_prefill<>>
@@ -149,7 +155,7 @@ struct gdn_prefill<D, rowwise_prefill<C, Scalar>> : gdn_head<D, Scalar> {
 namespace detail {
 
 // B=0 retains row-wise formation; B>0 selects blocked substitution.
-template <std::size_t D, std::size_t C, std::size_t B>
+template <std::size_t D, std::size_t C, std::size_t B, bool Joint = false>
 struct sme_prefill : gdn_head<D, sme_matrix_float> {
     static_assert(C > 0, "A chunk must contain at least one token");
     using base_type = gdn_head<D, sme_matrix_float>;
@@ -189,6 +195,46 @@ private:
                 for (std::size_t i = 0; i < height; ++i)
                     svst1_f32(cp, dst[row + i].data() + col,
                               svread_hor_za32_f32_m(zero, cp, 0, static_cast<uint32_t>(i)));
+            }
+        }
+    }
+
+    // [U,W]_block -= A_block,previous * [U,W]_previous.
+    // ZA0.S and ZA1.S share each coefficient load. No joint packing is needed.
+    // Only rows before begin are read as sources; destination rows follow them.
+    __attribute__((always_inline))
+    static inline void joint_update(const std::array<std::array<float, C>, C>& at,
+                                    std::array<vector_type, C>& u,
+                                    std::array<vector_type, C>& w,
+                                    std::size_t begin, std::size_t rows)
+        __arm_streaming __arm_inout("za") {
+        const std::size_t lanes = svcntw();
+        const svfloat32_t zero = svdup_f32(0);
+        for (std::size_t row = 0; row < rows; row += lanes) {
+            const svbool_t rp = svwhilelt_b32_u64(row, rows);
+            const std::size_t height = rows - row < lanes ? rows - row : lanes;
+            for (std::size_t col = 0; col < D; col += lanes) {
+                const svbool_t cp = svwhilelt_b32_u64(col, D);
+                for (std::size_t i = 0; i < height; ++i) {
+                    svwrite_hor_za32_f32_m(0, static_cast<uint32_t>(i), cp,
+                                         svld1_f32(cp, u[begin + row + i].data() + col));
+                    svwrite_hor_za32_f32_m(1, static_cast<uint32_t>(i), cp,
+                                         svld1_f32(cp, w[begin + row + i].data() + col));
+                }
+                for (std::size_t a = 0; a < begin; ++a) {
+                    const svfloat32_t coefficient = svneg_f32_x(
+                        rp, svld1_f32(rp, at[a].data() + begin + row));
+                    svmopa_za32_f32_m(0, rp, cp, coefficient,
+                                     svld1_f32(cp, u[a].data() + col));
+                    svmopa_za32_f32_m(1, rp, cp, coefficient,
+                                     svld1_f32(cp, w[a].data() + col));
+                }
+                for (std::size_t i = 0; i < height; ++i) {
+                    svst1_f32(cp, u[begin + row + i].data() + col,
+                              svread_hor_za32_f32_m(zero, cp, 0, static_cast<uint32_t>(i)));
+                    svst1_f32(cp, w[begin + row + i].data() + col,
+                              svread_hor_za32_f32_m(zero, cp, 1, static_cast<uint32_t>(i)));
+                }
             }
         }
     }
@@ -271,8 +317,12 @@ public:
                     // X_block = RHS_block - A_block,previous * X_previous.
                     // Read only solved rows; destination rows do not overlap them.
                     if (begin != 0) {
-                        product(gram, u, u.data() + begin, height, D, begin, -1, true, begin);
-                        product(gram, w, w.data() + begin, height, D, begin, -1, true, begin);
+                        if constexpr (Joint) {
+                            joint_update(gram, u, w, begin, height);
+                        } else {
+                            product(gram, u, u.data() + begin, height, D, begin, -1, true, begin);
+                            product(gram, w, w.data() + begin, height, D, begin, -1, true, begin);
+                        }
                     }
                     // Solve the unit-lower-triangular diagonal block with vectors.
                     for (std::size_t i = begin; i < end; ++i) {
@@ -348,6 +398,11 @@ struct gdn_prefill<D, sme_rowwise_prefill<C>> : detail::sme_prefill<D, C, 0> {};
 
 template <std::size_t D, std::size_t C, std::size_t B>
 struct gdn_prefill<D, sme_blocked_prefill<C, B>> : detail::sme_prefill<D, C, B> {
+    static_assert(B > 0, "A block must contain at least one token");
+};
+
+template <std::size_t D, std::size_t C, std::size_t B>
+struct gdn_prefill<D, sme_blocked_joint_prefill<C, B>> : detail::sme_prefill<D, C, B, true> {
     static_assert(B > 0, "A block must contain at least one token");
 };
 #endif

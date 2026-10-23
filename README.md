@@ -241,6 +241,7 @@ The object retains its final state between calls. Select one of these backends:
 - `rowwise_prefill<ChunkSize, Scalar>` performs portable row-wise WY formation.
 - `sme_rowwise_prefill<ChunkSize>` performs FP32 WY formation with SME.
 - `sme_blocked_prefill<ChunkSize, BlockSize>` uses SME blocked forward substitution.
+- `sme_blocked_joint_prefill<ChunkSize, BlockSize>` shares coefficient loads across U/W updates.
 
 ```cpp
 #include "prefill.h"
@@ -257,7 +258,7 @@ A zero token count permits null pointers and leaves state unchanged.
 Chunked backends handle partial final chunks and zero decay gates without division.
 Floating-point evaluation order differs from sequential generation.
 
-Both SME backends use one streaming region and private ZA context per call.
+All SME prefill backends use one streaming region and private ZA context per call.
 ZA0.S accumulates tiled Gram, attention, state-read, and state-update products.
 The row-wise backend uses streaming vectors for the entire triangular solve.
 The blocked backend uses ZA products to subtract contributions from earlier blocks,
@@ -265,8 +266,14 @@ then streaming vectors to solve each unit-lower-triangular diagonal block.
 `BlockSize` counts tokens, independently of the streaming vector length.
 It defaults to 16; partial blocks and blocks larger than a chunk are supported.
 For example, select `sme_blocked_prefill<64, 16>` for four blocks per full chunk.
-Both backends require SME FP32 outer products, but not SME2.
-Selecting either without an SME compilation target fails to compile.
+All SME backends require SME FP32 outer products, but not SME2.
+Selecting one without an SME compilation target fails to compile.
+
+The joint backend uses ZA0.S for U and ZA1.S for W during off-diagonal updates.
+Each coefficient vector is loaded once and supplies both outer products.
+U and W remain separate arrays; joint updates add no packing buffer or stack scratch.
+The diagonal solve and the rest of the prefill pipeline are unchanged.
+The separate-update blocked backend remains available for comparison.
 
 Scratch storage is on the stack: `4*C*D + 2*C*C + C` floats for chunk size `C`.
 For `D=128, C=64`, this is 160.25 KiB, excluding the object state and compiler spills.
@@ -347,7 +354,7 @@ g++ -std=c++17 -O3 -Wall -Wextra -Werror \
 
 `prefill_benchmark.cpp` times one whole prompt per trial at D=128 and chunk size 64.
 It compares FP32/FP64 sequential references, portable FP32 row-wise WY, an SME vector
-generation reference, SME row-wise WY, and SME blocked WY with block sizes 8, 16, and 32.
+generation reference, SME row-wise WY, and separate/joint SME blocked WY at block sizes 8, 16, and 32.
 It reports median/minimum ns per token, tokens per second from the median, and a checksum.
 
 ```sh

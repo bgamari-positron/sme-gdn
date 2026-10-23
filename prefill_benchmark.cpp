@@ -146,5 +146,8 @@ int main(int argc, char** argv) {
     benchmark<sme_blocked_prefill<chunk_size, 8>>("sme_blocked_B8", source, trials);
     benchmark<sme_blocked_prefill<chunk_size, 16>>("sme_blocked_B16", source, trials);
     benchmark<sme_blocked_prefill<chunk_size, 32>>("sme_blocked_B32", source, trials);
+    benchmark<sme_blocked_joint_prefill<chunk_size, 8>>("sme_joint_B8", source, trials);
+    benchmark<sme_blocked_joint_prefill<chunk_size, 16>>("sme_joint_B16", source, trials);
+    benchmark<sme_blocked_joint_prefill<chunk_size, 32>>("sme_joint_B32", source, trials);
 #endif
 }
